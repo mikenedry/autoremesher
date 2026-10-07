@@ -74,7 +74,7 @@ public:
         int targetQuads, double edgeScaling,
         double sharpEdgeDegrees, double smoothNormalDegrees,
         double adaptivity,
-        double anisotropy);
+        double anisotropy, bool clothFoldGuidance = false);
     void runHeadless();
     void saveMeshToFile(const QString& filename);
 
@@ -126,6 +126,7 @@ private:
     float m_smoothNormalDegrees = 0.0;
     float m_adaptivity = 1.0;
     float m_anisotropy = 1.0;
+    bool m_clothFoldGuidance = false;
     AutoRemesher::ModelType m_modelType = AutoRemesher::ModelType::Organic;
     std::vector<AutoRemesher::Vector3> m_originalVertices;
     std::vector<std::vector<size_t>> m_originalTriangles;
@@ -153,6 +154,7 @@ private:
     FloatNumberWidget* m_smoothNormalDegreesWidget = nullptr;
     FloatNumberWidget* m_adaptivityWidget = nullptr;
     FloatNumberWidget* m_anisotropyWidget = nullptr;
+    QCheckBox* m_clothFoldGuidanceCheckBox = nullptr;
     QLabel* m_quadCountLabel = nullptr;
     QLabel* m_nonQuadCountLabel = nullptr;
     QLabel* m_vertexCountLabel = nullptr;

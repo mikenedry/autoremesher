@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -95,8 +96,8 @@ namespace {
         Creases,
         Diagonals };
     struct LayoutQuality {
-        double angle = 0, error = 0, area = 0, weight = 0, rimError = 0;
-        size_t corners = 0, boundary = 0, nonmanifold = 0, parts = 0, nonquads = 0, collapsed = 0;
+        double angle = 0, error = 0, area = 0, weight = 0, rimError = 0, cornerLoss = 0;
+        size_t corners = 0, boundary = 0, nonmanifold = 0, parts = 0, nonquads = 0, collapsed = 0, invalidQuads = 0;
     };
     LayoutQuality measureLayout(QuadExtractor& mesh, const SurfaceAnalysis& reference, double sourceArea)
     {
@@ -105,6 +106,19 @@ namespace {
         const auto& faces = mesh.remeshedQuads();
         std::map<std::pair<size_t, size_t>, size_t> edges;
         for (const auto& f : faces) {
+            if (f.size() == 4) {
+                const auto normal = Vector3::crossProduct(points[f[2]] - points[f[0]], points[f[3]] - points[f[1]]);
+                bool valid = false;
+                for (size_t start = 0; start < 2; ++start) {
+                    const auto& a = points[f[start]];
+                    const auto& b = points[f[(start + 1) % 4]];
+                    const auto& c = points[f[(start + 2) % 4]];
+                    const auto& d = points[f[(start + 3) % 4]];
+                    valid |= Vector3::dotProduct(Vector3::crossProduct(b - a, c - a), normal) > 0
+                        && Vector3::dotProduct(Vector3::crossProduct(c - a, d - a), normal) > 0;
+                }
+                q.invalidQuads += !valid;
+            }
             Vector3 center;
             double area = 0;
             for (size_t v : f)
@@ -125,7 +139,10 @@ namespace {
                 if (f.size() != 4)
                     continue;
                 const Vector3 a = points[f[(k + 3) % 4]] - points[f[k]], b = points[f[(k + 1) % 4]] - points[f[k]];
-                q.angle += area * (a.lengthSquared() * b.lengthSquared() > 0 ? std::asin(std::min(1.0, std::fabs(Vector3::dotProduct(a.normalized(), b.normalized())))) : M_PI / 2);
+                const bool nondegenerate = a.lengthSquared() * b.lengthSquared() > 0;
+                const double cosine = nondegenerate ? std::min(1.0, std::fabs(Vector3::dotProduct(a.normalized(), b.normalized()))) : 1.;
+                q.angle += area * (nondegenerate ? std::asin(cosine) : M_PI / 2);
+                q.cornerLoss += area * cosine * cosine;
                 ++q.corners;
                 q.weight += area;
             }
@@ -159,6 +176,7 @@ namespace {
         }
         q.nonquads -= std::min(q.nonquads, mesh.poleTriangles());
         q.angle = q.weight ? q.angle / q.weight : M_PI;
+        q.cornerLoss = q.weight ? q.cornerLoss / q.weight : 1.;
         q.error = q.area > 0 ? q.error / q.area : std::numeric_limits<double>::infinity();
         // A quad and its reversed copy enclose no surface; their angles
         // cannot veto recovery of the original component.
@@ -175,7 +193,8 @@ namespace {
     }
 
     bool preferFeatureLayout(QuadExtractor& before, QuadExtractor& after,
-        const SurfaceAnalysis& reference, double sourceArea, bool recoverConnectivity = false, PreparationRecovery preparation = PreparationRecovery::None)
+        const SurfaceAnalysis& reference, double sourceArea, bool recoverConnectivity = false, PreparationRecovery preparation = PreparationRecovery::None,
+        const std::function<const std::vector<SurfaceGuidance::Face>*()>& sourceFlow = {})
     {
         const bool recoverPreparation = preparation == PreparationRecovery::Creases;
         const auto a = measureLayout(before, reference, sourceArea), b = measureLayout(after, reference, sourceArea);
@@ -193,13 +212,32 @@ namespace {
         const double fittingLimit = std::max(a.error * (recoverArea ? 1.05 : 1.), std::pow(.05 * reference.length(), 2));
         // Keep the same one-tenth-cell tolerance used to recognize authored rims.
         const bool keepsRim = b.rimError <= std::max(a.rimError, std::pow(.1 * reference.length(), 2));
-        return b.corners && keepsRim && (!recoverPreparation || (b.parts == 1 && b.boundary <= a.boundary && b.error < a.error && b.area < a.area)) && b.nonmanifold <= a.nonmanifold && b.collapsed <= a.collapsed && (after.remeshedQuads().size() <= 2 * before.remeshedQuads().size() || (recoverForm && b.area < a.area * .5 && b.angle <= std::max(a.angle, .15))) && (recoverRim || (recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
+        const bool admissible = b.corners && keepsRim && (!recoverPreparation || (b.parts == 1 && b.boundary <= a.boundary && b.error < a.error && b.area < a.area)) && b.nonmanifold <= a.nonmanifold && b.collapsed <= a.collapsed && (after.remeshedQuads().size() <= 2 * before.remeshedQuads().size() || (recoverForm && b.area < a.area * .5 && b.angle <= std::max(a.angle, .15)));
+        const bool recoverCells = reference.openFoldWorkflow() && a.invalidQuads > 0 && b.invalidQuads == 0 && b.error <= fittingLimit
+            && b.angle <= a.angle && b.area <= a.area + .03 && b.boundary <= a.boundary
+            && b.parts <= a.parts && b.nonquads <= a.nonquads;
+        if (admissible && (recoverCells || recoverRim || (recoverForm && b.area < a.area && (b.area < a.area * .5 || b.error < a.error * .5 || (((recoverConnectivity && b.parts < a.parts) || (recoverPreparation && b.error < a.error)) && b.boundary <= a.boundary)) && b.angle <= a.angle + .15 && b.error < fittingLimit && b.parts <= std::max(size_t(1), a.parts)) ||
                    // Closing unintended holes permits small angle distortion, while
                    // retaining fitting and connectivity limits. Closing boundary edges
                    // may replace them with a small number of nonquad repair faces.
                    (a.boundary > 0 && b.boundary * 4 < a.boundary && b.angle < std::max(a.angle, .1) && b.area <= a.area + .03 && b.error < std::max(a.error, std::pow(.1 * reference.length(), 2)) && b.parts <= a.parts && b.nonquads + b.boundary <= a.nonquads + a.boundary) ||
                    // Avoid buying tiny fitting gains with a needlessly dense flat grid.
-                   ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads));
+                   ((after.remeshedQuads().size() * 2 < before.remeshedQuads().size() || (after.remeshedQuads().size() * 4 < before.remeshedQuads().size() * 3 && b.angle < a.angle)) && b.nonquads == 0 && b.angle < .15 && b.area < .03 && b.error < std::pow(.05 * reference.length(), 2) && b.boundary <= a.boundary && b.parts <= a.parts) || (b.angle < a.angle && b.error <= a.error && b.area <= a.area + .03 && b.boundary <= a.boundary && b.nonmanifold <= a.nonmanifold && b.parts <= a.parts && b.nonquads <= a.nonquads)))
+            return true;
+        // Only unresolved, geometrically admissible comparisons pay for source flow.
+        // Existing acceptance and every fitting/topology guard remain authoritative.
+        if (!reference.openFoldWorkflow() || !admissible || !sourceFlow || !(b.angle < .15 && b.error <= a.error
+                && b.area <= a.area + .03 && b.boundary <= a.boundary
+                && b.parts <= a.parts && b.nonquads <= a.nonquads))
+            return false;
+        const auto* guidance = sourceFlow();
+        if (!guidance || std::none_of(guidance->begin(), guidance->end(),
+                             [](const SurfaceGuidance::Face& face) { return face.confidence > 0; }))
+            return false;
+        const auto first = reference.measureLayoutFit(before.remeshedVertices(), before.remeshedQuads(), guidance);
+        const auto second = reference.measureLayoutFit(after.remeshedVertices(), after.remeshedQuads(), guidance);
+        return first.flowWeight > 0 && second.flowWeight > 0 && second.flowError < first.flowError
+            && second.flowError + b.cornerLoss < first.flowError + a.cornerLoss;
     }
 
     bool isSmallConvexSource(const std::vector<Vector3>& vertices,
@@ -720,7 +758,7 @@ bool AutoRemesher::remesh()
                 m_preparedIslands[islandIndex].reference = std::make_shared<const ReferenceSurface>(std::move(reference));
 
                 context.analysis.reset(new SurfaceAnalysis(sourceMesh, m_voxelSize,
-                    m_sharpEdgeDegrees, m_adaptivity, m_anisotropy));
+                    m_sharpEdgeDegrees, m_adaptivity, m_anisotropy, false, true, false, nullptr, m_clothFoldGuidance));
                 m_preparedIslands[islandIndex].analysis = context.analysis;
                 // Zero means use the parameterizer's default scale of one.
                 context.scaling = m_scaling > 0 ? m_scaling : 1.0;
@@ -871,7 +909,7 @@ bool AutoRemesher::remesh()
         if (m_targetTriangleCount > 800 || featureContexts.size() > 2)
             c.voxelSize = std::min(c.voxelSize, std::sqrt(calculateMeshArea(c.vertices, c.triangles) / 20));
         c.analysis.reset(new SurfaceAnalysis(SurfaceMesh(c.vertices, c.triangles), c.voxelSize,
-            c.sharpEdgeDegrees, c.adaptivity, c.anisotropy, true, false));
+            c.sharpEdgeDegrees, c.adaptivity, c.anisotropy, true, false, false, c.analysis.get()));
         c.samplingLength = std::min(c.voxelSize, samplingLength);
         const auto start = std::chrono::high_resolution_clock::now();
         resample(c.vertices, c.triangles, c.samplingLength, c.adaptivity, c.sharpEdgeDegrees, c.smoothNormalDegrees,
@@ -991,6 +1029,7 @@ bool AutoRemesher::remesh()
                             &triangles,
                             uvs.get());
                         thread.remesher->setSurfaceAnalysis(thread.island->analysis.get());
+                        thread.remesher->setRelaxationMetric(&thread.parameterizer->relaxationMetric());
                         thread.remesher->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
                         thread.remesher->setSingularVertices(&thread.capturedSingularVertexIndices);
                         thread.remesher->setFullTurnVertices(&thread.parameterizer->fullTurnVertices());
@@ -1009,6 +1048,7 @@ bool AutoRemesher::remesh()
                                 if (parts.size() > 1) {
                                     auto supported = std::make_unique<QuadExtractor>(&vertices, &triangles, uvs.get());
                                     supported->setSurfaceAnalysis(thread.island->analysis.get());
+                                    supported->setRelaxationMetric(&thread.parameterizer->relaxationMetric());
                                     supported->setOriginalTriangleUvs(&thread.capturedOriginalUvs);
                                     supported->setSingularVertices(&thread.capturedSingularVertexIndices);
                                     supported->setFullTurnVertices(&thread.parameterizer->fullTurnVertices());
@@ -1099,6 +1139,17 @@ bool AutoRemesher::remesh()
                 layoutTrial = true;
                 // Keep the baseline winner; one extra solve tests final-frame spacing
                 // on the same prepared source under the unchanged quality checks.
+                // Cached source evidence never mutates preparation or trial guidance.
+                std::unique_ptr<const std::vector<SurfaceGuidance::Face>> flowGuidance;
+                const auto sourceFlow = [&]() -> const std::vector<SurfaceGuidance::Face>* {
+                    if (!flowGuidance) {
+                        const auto& context = (*m_featureContexts)[i];
+                        SurfaceAnalysis measured(SurfaceMesh(source.vertices, source.triangles),
+                            context.analysis->length(), context.sharpEdgeDegrees, 0, 0, true, true, true, context.analysis.get());
+                        flowGuidance.reset(new const std::vector<SurfaceGuidance::Face>(measured.faces()));
+                    }
+                    return flowGuidance.get();
+                };
                 bool sourceLayoutAccepted = false;
                 for (size_t variant = 0; variant < 5; ++variant) {
                     std::shared_ptr<IslandContext> crease;
@@ -1141,11 +1192,11 @@ bool AutoRemesher::remesh()
                     const auto recovery = variant == 4 ? PreparationRecovery::Creases : variant == 3 ? PreparationRecovery::Diagonals
                         : variant                                                                    ? PreparationRecovery::Source
                                                                                                      : PreparationRecovery::None;
-                    bool accepted = thread.remesher && (!saved.remesher || preferFeatureLayout(*saved.remesher, *thread.remesher, *saved.island->analysis, sourceArea, false, recovery));
+                    bool accepted = thread.remesher && (!saved.remesher || preferFeatureLayout(*saved.remesher, *thread.remesher, *saved.island->analysis, sourceArea, false, recovery, sourceFlow));
                     // Test both extractions against the retained winner: a local choice
                     // must not discard a source layout that beats the previous trial.
                     auto* winner = accepted ? thread.remesher.get() : saved.remesher.get();
-                    if (thread.connectivityProposal && (!winner || preferFeatureLayout(*winner, *thread.connectivityProposal, *saved.island->analysis, sourceArea, true, recovery))) {
+                    if (thread.connectivityProposal && (!winner || preferFeatureLayout(*winner, *thread.connectivityProposal, *saved.island->analysis, sourceArea, true, recovery, sourceFlow))) {
                         thread.remesher = std::move(thread.connectivityProposal);
                         accepted = true;
                         thread.capturedExtractedConnections = thread.remesher->extractedConnections();

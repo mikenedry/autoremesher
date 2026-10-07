@@ -49,6 +49,7 @@ struct HeadlessParams {
     double smoothNormalDegrees = 0.0;
     double adaptivity = 1.0;
     double anisotropy = 1.0;
+    bool clothFoldGuidance = false;
 };
 
 static HeadlessParams parseHeadlessArgs(QCommandLineParser& parser)
@@ -70,6 +71,7 @@ static HeadlessParams parseHeadlessArgs(QCommandLineParser& parser)
         params.adaptivity = parser.value("adaptivity").toDouble();
     if (parser.isSet("anisotropy"))
         params.anisotropy = parser.value("anisotropy").toDouble();
+    params.clothFoldGuidance = parser.isSet("cloth-folds");
     return params;
 }
 
@@ -135,6 +137,9 @@ int main(int argc, char** argv)
         QCoreApplication::translate("main", "Curvature-adaptive quad elongation (default: 1.0, range: 0.0-1.0)"),
         QCoreApplication::translate("main", "value"));
     parser.addOption(anisotropyOption);
+
+    parser.addOption(QCommandLineOption(QStringList { "cloth-folds" },
+        QCoreApplication::translate("main", "Guide quad rows along curved folds on open cloth surfaces")));
 
     parser.process(app);
 
@@ -205,6 +210,7 @@ int main(int argc, char** argv)
                         out << "Smooth normal degrees: " << params.smoothNormalDegrees << "\n";
                         out << "Adaptivity: " << params.adaptivity << "\n";
                         out << "Anisotropy: " << params.anisotropy << "\n\n";
+                        out << "Cloth folds: " << params.clothFoldGuidance << "\n\n";
                         out << "Results:\n";
                         out << "  Quads: " << quadCount << "\n";
                         out << "  Non-quads: " << nonQuadCount << "\n";
@@ -220,7 +226,7 @@ int main(int argc, char** argv)
         mainWindow->setHeadlessParams(params.inputPath, params.outputPath,
             params.targetQuads, params.edgeScaling,
             params.sharpEdgeDegrees, params.smoothNormalDegrees,
-            params.adaptivity, params.anisotropy);
+            params.adaptivity, params.anisotropy, params.clothFoldGuidance);
         mainWindow->runHeadless();
 
         return app.exec();

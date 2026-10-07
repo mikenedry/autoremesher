@@ -122,6 +122,7 @@ namespace {
         bool featureLayout;
         const std::vector<char>& fullTurns;
         double hardEdgeDegrees;
+        bool preserveFeatureOrder;
     };
 
     void initializeFieldAndNormals(const SurfaceMesh& mesh, const std::vector<Vector3>* guidance,
@@ -628,9 +629,12 @@ namespace {
             for (const auto& item : connections)
                 ordered.push_back(item.second);
             std::sort(ordered.begin(), ordered.end(), [](const Connection& a, const Connection& b) { return std::fabs(a.primary) < std::fabs(b.primary); });
+            // Retain the open-fold cover's ordering when opening a one-cell band.
+            // The field integral can have the opposite sign near staggered feature tips.
             for (const auto& c : ordered)
                 if (std::fabs(c.primary) < 1.35 && std::fabs(c.orthogonal) < 2 * std::fabs(c.primary) && std::fabs(c.direction) > 1e-12)
-                    system.separateIntegerCoordinates(2 * c.first + axis, 2 * c.second + axis, c.direction > 0 ? 1 : -1);
+                    system.separateIntegerCoordinates(2 * c.first + axis, 2 * c.second + axis,
+                        (ctx.preserveFeatureOrder ? c.primary : c.direction) > 0 ? 1 : -1);
         }
     }
 
@@ -931,7 +935,8 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
     const std::vector<double>* faceScalingU,
     const std::vector<double>* faceScalingV,
     const ProgressHandler* progressHandler,
-    const std::vector<char>* featureCorners, bool featureLayout, const SurfaceGuidance* sizing, bool preserveBoundary)
+    const std::vector<char>* featureCorners, bool featureLayout, const SurfaceGuidance* sizing, bool preserveBoundary,
+    bool preserveFeatureOrder)
 {
     const auto report = [progressHandler](float fraction, const char* name) {
         if (nullptr != progressHandler && *progressHandler)
@@ -1012,8 +1017,17 @@ bool QuadParameterizer::parameterize(const std::vector<Vector3>& vertices,
             result->fullTurnVertices.push_back(v);
     const std::vector<char> seam = computeSeam(mesh, rotation, fullTurns);
 
+    result->physicalSpacing.clear();
+    if (featureLayout) {
+        result->physicalSpacing.resize(mesh.faceCount());
+        for (size_t f = 0; f < mesh.faceCount(); ++f) {
+            const double h = scale * (faceScaling ? (*faceScaling)[f] : 1.);
+            result->physicalSpacing[f] = Vector2(h * activeScalingU[f], h * activeScalingV[f]);
+        }
+    }
+
     const CoverContext ctx { mesh, result->field, normals, rotation, seam, cornerConstraints,
-        activeScalingU, activeScalingV, faceScaling, scale, featureLayout, fullTurns, hardEdgeDegrees };
+        activeScalingU, activeScalingV, faceScaling, scale, featureLayout, fullTurns, hardEdgeDegrees, preserveFeatureOrder };
 
     // The cover solve reports on its own 0..1, so remap it into the tail of this
     // function's range and keep the fractions monotonic end to end.

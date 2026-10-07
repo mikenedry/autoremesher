@@ -69,7 +69,7 @@ namespace {
 }
 
 bool FrameField::create(const SurfaceMesh& mesh, double sharpEdgeDegrees,
-    std::vector<Vector3>* field, const SurfaceGuidance* guidance, bool fixedCurvature)
+    std::vector<Vector3>* field, const SurfaceGuidance* guidance, bool fixedCurvature, bool taperCurvature)
 {
     if (nullptr == field || mesh.faceCount() == 0)
         return false;
@@ -95,8 +95,16 @@ bool FrameField::create(const SurfaceMesh& mesh, double sharpEdgeDegrees,
         const double angle = kSymmetry * tangentAngle(face.direction, facetBases[f]);
         periodic[2 * f] = std::cos(angle);
         periodic[2 * f + 1] = std::sin(angle);
+        const bool feature = guidance->featureCorners[3 * f] ||
+            guidance->featureCorners[3 * f + 1] || guidance->featureCorners[3 * f + 2];
         certainty[f] = face.confidence;
-        locked[f] = face.confidence >= 1.0 && (fixedCurvature || guidance->featureCorners[3 * f] || guidance->featureCorners[3 * f + 1] || guidance->featureCorners[3 * f + 2]);
+        if (taperCurvature && fixedCurvature && !feature && face.confidence >= 1.) {
+            // Marginal curvature estimates may disagree across nearby sampling meshes.
+            // Let neighboring directions guide them until support reaches twice the cutoff.
+            const double margin = 3.7979 * face.major * face.radius - 1.;
+            certainty[f] = .12 + .88 * std::max(0., std::min(1., margin));
+        }
+        locked[f] = certainty[f] >= 1.0 && (fixedCurvature || feature);
     }
 
     const auto normalizePeriodic = [&]() {

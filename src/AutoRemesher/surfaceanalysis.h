@@ -1,6 +1,7 @@
 #ifndef AUTO_REMESHER_SURFACE_ANALYSIS_H
 #define AUTO_REMESHER_SURFACE_ANALYSIS_H
 #include <AutoRemesher/SurfaceMesh>
+#include <AutoRemesher/SurfaceRelaxation>
 #include <axisalignedboundingboxtree.h>
 #include <memory>
 #include <unordered_set>
@@ -28,7 +29,7 @@ public:
         bool closed = false, directional = true;
     };
     SurfaceAnalysis(const SurfaceMesh& mesh, double length, double sharpDegrees,
-        double adaptivity, double anisotropy, bool featureLayout = false, bool measureCurvature = true, bool deferSpacing = false);
+        double adaptivity, double anisotropy, bool featureLayout = false, bool measureCurvature = true, bool deferSpacing = false, const SurfaceAnalysis* original = nullptr, bool clothFoldGuidance = false);
     SurfaceAnalysis(const SurfaceAnalysis&) = delete; // The tree refers to this object's box array.
     // sameTopology requires the exact mesh used to construct this analysis.
     SurfaceGuidance transfer(const SurfaceMesh& mesh, bool sameTopology = false) const;
@@ -47,20 +48,31 @@ public:
         std::vector<std::vector<size_t>>& faces) const;
     void relaxSurface(std::vector<Vector3>& vertices,
         const std::vector<std::unordered_set<size_t>>& neighbors,
-        const std::vector<bool>& locked, const std::vector<std::vector<size_t>>& polygons, size_t iterations) const;
+        const std::vector<bool>& locked, const std::vector<std::vector<size_t>>& polygons, size_t iterations,
+        const std::vector<SurfaceRelaxationStencil>* stencils = nullptr) const;
     const std::vector<Chain>& chains() const { return m_chains; }
     const std::vector<SurfaceGuidance::Face>& faces() const { return m_faces; }
     double length() const { return m_length; }
     bool featureLayout() const { return m_featureLayout; }
+    bool openFoldWorkflow() const { return m_openFoldWorkflow; }
     bool supportsRimConstraints() const { return m_preserveRim; }
     bool onSourceBoundary(const Vector3& position) const;
     bool onSourceBoundary(const Vector3& first, const Vector3& second) const;
     double surfaceDistanceSquared(const Vector3& position, Vector3* normal = nullptr) const;
+    struct LayoutFit {
+        double missingError = 0, flowError = 0, flowWeight = 0;
+    };
+    // sourceFlow uses this original source mesh's exact face indexing.
+    LayoutFit measureLayoutFit(const std::vector<Vector3>& vertices,
+        const std::vector<std::vector<size_t>>& faces,
+        const std::vector<SurfaceGuidance::Face>* sourceFlow = nullptr) const;
     double missingSurfaceError(const std::vector<Vector3>& vertices, const std::vector<std::vector<size_t>>& faces) const;
 
 private:
     void traceFeatureChains(double sharpDegrees);
     void resolveFeatureJunctions();
+    void restoreCreaseDirections();
+    void resolveFoldDirections();
     void measureFaceCurvature();
     void measureVertexCurvature();
     double initializeDirectionalSizes(double adaptivity, double anisotropy);
@@ -76,6 +88,8 @@ private:
     bool m_featureLayout = false;
     bool m_hasBoundary = false;
     bool m_preserveRim = false;
+    // Inherited from the immutable original island, never from prepared holes or caps.
+    const bool m_openFoldWorkflow;
     std::vector<AxisAlignedBoudingBox> m_boxes;
     std::unique_ptr<AxisAlignedBoudingBoxTree> m_tree;
     size_t nearestFace(const Vector3& p) const;

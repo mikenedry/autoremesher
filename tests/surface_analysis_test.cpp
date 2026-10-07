@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <type_traits>
@@ -105,6 +106,17 @@ static void creaseAndTransfer()
     SurfaceAnalysis analysis(mesh, .2, 90, 1, 1);
     for (const auto& face : analysis.faces())
         require(face.major < 1e-12 && face.minor < 1e-12 && face.scale == 1, "a crease injected curvature into its planar patches");
+    // A weak alignment guide is not a sharp-crease exclusion for vertex tensors.
+    SurfaceAnalysis aligned(mesh, .2, 90, 1, 1, true, true, false, nullptr, true);
+    require(std::count_if(aligned.faces().begin(), aligned.faces().end(),
+                [](const SurfaceGuidance::Face& face) { return face.major > .1; }) > t.size() / 2,
+        "weak alignment guide erased the fold's curvature samples");
+    const auto alignedGuidance = aligned.transfer(mesh, true);
+    size_t alignedCorners = 0;
+    for (size_t c = 0; c < mesh.cornerCount(); ++c)
+        alignedCorners += !mesh.isBoundaryCorner(c) && alignedGuidance.featureCorners[c];
+    require(alignedCorners == 16,
+        "curvature sampling removed the alignment constraints");
     auto narrow = p;
     for (auto& point : narrow)
         point = V(point.x(), .01 * point.y(), .01 * point.z());
@@ -305,6 +317,46 @@ static void missingSurface()
     require(std::isinf(reference.missingSurfaceError({}, {})), "empty output has finite fitting error");
 }
 
+static void rimWorkflow()
+{
+    // Duplicate adjacency is not an authored opening, but must retain the
+    // established rim constraint independently of fold-workflow classification.
+    const SurfaceMesh duplicatedMesh(
+        { { 0, 0, 0 }, { 4, 0, 0 }, { 0, 4, 0 }, { 0, 0, 4 } },
+        { { 0, 2, 1 }, { 0, 1, 3 }, { 0, 3, 2 }, { 1, 2, 3 }, { 0, 2, 1 } });
+    const SurfaceAnalysis duplicated(duplicatedMesh, 1, 90, 0, 0, false, false);
+    require(!duplicated.openFoldWorkflow() && duplicated.supportsRimConstraints(),
+        "authored-opening classification changed the existing rim workflow");
+    const SurfaceAnalysis clothDuplicated(duplicatedMesh, 1, 90, 0, 0, false, false, false, nullptr, true);
+    require(!clothDuplicated.openFoldWorkflow() && clothDuplicated.supportsRimConstraints(),
+        "cloth mode treated duplicate adjacency as an authored opening");
+    // A cut solid has one planar opening; bending that opening makes it a sheet.
+    const std::vector<std::vector<size_t>> triangles = {
+        { 0, 1, 4 }, { 1, 2, 4 }, { 2, 3, 4 }, { 3, 0, 4 }
+    };
+    for (double scale : { 1., 7. }) {
+        auto pose = [&](const V& p) { return scale * V(p.z(), p.x(), p.y()); };
+        std::vector<V> points = { V(-1, -1, 0), V(1, -1, 0), V(1, 1, 0), V(-1, 1, 0), V(0, 0, 1) };
+        for (auto& p : points)
+            p = pose(p);
+        SurfaceMesh cut(points, triangles);
+        SurfaceAnalysis solid(cut, .1 * scale, 90, 0, 0, true, false, false, nullptr, true);
+        require(solid.supportsRimConstraints() && !solid.openFoldWorkflow(), "planar cut lost its established rim workflow");
+        points[0] += pose(V(0, 0, 1));
+        const SurfaceMesh sheetMesh(points, triangles);
+        SurfaceAnalysis legacySheet(sheetMesh, .1 * scale, 90, 0, 0, true, false);
+        require(!legacySheet.supportsRimConstraints() && !legacySheet.openFoldWorkflow(),
+            "default analysis enabled cloth guidance for a spatial opening");
+        SurfaceAnalysis sheet(sheetMesh, .1 * scale, 90, 0, 0, true, false, false, nullptr, true);
+        require(!sheet.supportsRimConstraints() && sheet.openFoldWorkflow(), "spatial opening lost fold guidance");
+        // Preparation may flatten a rim; its local shape must not change the source policy.
+        SurfaceAnalysis prepared(cut, .1 * scale, 90, 0, 0, true, false, false, &sheet);
+        require(prepared.supportsRimConstraints() && prepared.openFoldWorkflow(), "prepared rim replaced the source workflow");
+        SurfaceAnalysis preparedLegacy(sheetMesh, .1 * scale, 90, 0, 0, true, false, false, &legacySheet, true);
+        require(!preparedLegacy.openFoldWorkflow(), "preparation enabled cloth guidance for a legacy source");
+    }
+}
+
 static void roundRimRecovery()
 {
     const size_t sides = 64, rings = 8;
@@ -408,9 +460,438 @@ static void residualHoles()
     watertight(output);
 }
 
+static void competingFold()
+{
+    // A two-edge curved crease meets a short, nearly parallel 78-degree
+    // branch. The branch lacks geometric strength but still conflicts with
+    // fixing the crease as a grid axis. Coordinates form a manifold patch.
+    const std::vector<V> p = {
+        { -1.1739, 1.5743, -1.2032 }, { -0.9719, 1.5606, -1.3530 },
+        { -0.2848, 0.1854, 0.1866 }, { -0.7125, 0.8861, -0.5067 },
+        { -0.0240, 0.0766, 0.2073 }, { -0.5075, 0.8640, -0.5964 },
+        { 0.0128, -1.9678, 1.1396 }, { -1.1317, 1.5229, -1.5903 },
+        { 0.5004, -2.3070, 1.4073 }, { 0.4967, -0.9420, 0.7634 },
+        { 0.8051, -1.4823, 1.0759 }, { 0.8672, -1.3979, 0.9903 },
+        { 0.5962, -2.5440, 1.2930 }, { 0.5539, -1.2169, 0.7005 },
+        { 0.1299, -0.6350, 0.2416 }, { 0.5210, -0.6479, 0.5285 },
+        { 0.0000, 0.0000, 0.0000 }, { -0.6024, 0.7218, -0.7605 },
+        { -0.6768, 0.6547, -0.8524 },
+    };
+    const std::vector<std::vector<size_t>> t = {
+        { 3, 2, 4 }, { 4, 5, 3 }, { 0, 3, 5 }, { 5, 1, 0 },
+        { 6, 4, 2 }, { 9, 4, 6 }, { 6, 8, 9 }, { 10, 9, 8 },
+        { 14, 13, 12 }, { 16, 4, 9 }, { 9, 15, 16 }, { 15, 9, 10 },
+        { 10, 11, 15 }, { 13, 15, 11 }, { 14, 16, 15 }, { 15, 13, 14 },
+        { 7, 17, 18 }, { 17, 7, 1 }, { 1, 5, 17 }, { 16, 17, 5 },
+        { 5, 4, 16 }, { 14, 18, 17 }, { 17, 16, 14 },
+    };
+    for (double scale : { 1., 7. }) {
+        std::vector<V> q;
+        for (const auto& v : p)
+            q.push_back(scale * (scale == 1 ? v : V(v.z(), v.x(), v.y())));
+        SurfaceMesh mesh(q, t);
+        SurfaceAnalysis analysis(mesh, 1.4 * scale, 90, 1, 1, true, true, false, nullptr, true);
+        const auto guidance = analysis.transfer(mesh, true);
+        const auto chainOnEdge = [&](size_t a, size_t b) -> const SurfaceAnalysis::Chain* {
+            for (const auto& chain : analysis.chains())
+                for (size_t c : chain.corners) {
+                    const size_t x = mesh.cornerVertex(c), y = mesh.cornerVertex(mesh.nextCorner(c));
+                    if ((x == a && y == b) || (x == b && y == a))
+                        return &chain;
+                }
+            return nullptr;
+        };
+        const auto* fold = chainOnEdge(15, 16);
+        const auto* branch = chainOnEdge(9, 16);
+        require(fold && fold->strength == 1 && branch && branch->strength == 0,
+            "invalid strong-fold/weak-competitor surface");
+        for (size_t c : fold->corners)
+            require(!guidance.featureCorners[c], "zero-strength competitor was ignored when fixing a fold axis");
+        for (size_t c = 0; c < mesh.cornerCount(); ++c)
+            if (mesh.isBoundaryCorner(c))
+                require(guidance.featureCorners[c], "directional conflict removed an authored border axis");
+        const V midpoint = .5 * (q[15] + q[16]);
+        const V displaced = midpoint + .02 * scale * mesh.faceNormal(fold->corners.front() / 3);
+        const auto binding = analysis.bindCurve(displaced, .05 * scale);
+        require(binding.chain != SurfaceMesh::npos && analysis.chains()[binding.chain].strength == 1,
+            "directional conflict removed geometric crease protection");
+        require((analysis.projectCurve(binding, displaced) - midpoint).length() < 1e-10 * scale,
+            "directional conflict changed crease projection");
+    }
+}
+
+static void foldedStrip(bool curved, bool closed = false, bool varying = false)
+{
+    // The constant control is a uniform 120-degree crease. The varying fold
+    // changes its cross-section smoothly from 50 to 130 degrees along the arc.
+    // Only the middle row lies off the authored open border.
+    std::vector<V> p;
+    std::vector<std::vector<size_t>> t;
+    for (size_t i = 0; i <= 12; ++i)
+        for (int j = -1; j <= 1; ++j) {
+            const double a = i * M_PI / 18, r = 2 + .15 * j;
+            const double phi = (varying ? 50 + 80 * double(i) / 12 : 120) * M_PI / 180;
+            const double height = .15 * std::tan(phi / 2) * std::abs(j);
+            p.push_back(curved ? V(r * std::cos(a), r * std::sin(a), height)
+                               : V(2 * a, .15 * j, height));
+        }
+    for (size_t i = 0; i < 12; ++i) {
+        for (size_t j = 0; j < 2; ++j) {
+            const size_t a = 3 * i + j, b = a + 3;
+            t.push_back({ a, b, b + 1 });
+            t.push_back({ a, b + 1, a + 1 });
+        }
+        if (closed) {
+            const size_t a = 3 * i;
+            t.push_back({ a + 2, a + 5, a + 3 });
+            t.push_back({ a + 2, a + 3, a });
+        }
+    }
+    if (closed) {
+        t.push_back({ 0, 1, 2 });
+        t.push_back({ 38, 37, 36 });
+    }
+    SurfaceMesh mesh(p, t);
+    SurfaceAnalysis analysis(mesh, .2, 90, 1, 1, true, true, false, nullptr, true);
+    const auto guidance = analysis.transfer(mesh, true);
+    size_t foldEdges = 0, foldAxes = 0, borderEdges = 0, physical = 0;
+    for (size_t c = 0; c < mesh.cornerCount(); ++c) {
+        if (mesh.isBoundaryCorner(c)) {
+            ++borderEdges;
+            require(guidance.featureCorners[c], "curved authored border lost its grid constraint");
+        }
+        if (mesh.cornerVertex(c) % 3 == 1 && mesh.cornerVertex(mesh.nextCorner(c)) % 3 == 1) {
+            ++foldEdges;
+            foldAxes += !!guidance.featureCorners[c];
+        }
+    }
+    for (const auto& f : analysis.faces()) physical += f.major > .1;
+    const V midpoint = (p[16] + p[19]) * .5, displaced = midpoint + V(0, 0, .02);
+    const auto binding = analysis.bindCurve(displaced, .05);
+    require(binding.chain != SurfaceMesh::npos, "fold lost its protected geometry");
+    require((analysis.projectCurve(binding, displaced) - midpoint).length() < 1e-12,
+        "protected fold no longer restores displaced vertices");
+    require(foldEdges == 24 && borderEdges == (closed ? 0 : 28), "invalid folded-strip topology");
+    const bool curvatureDriven = curved && !closed && varying;
+    require(curvatureDriven ? physical > t.size() / 2 : physical == 0,
+        "curved cloth fold lost physical curvature samples, or protected control gained curvature");
+    require(foldAxes == (curvatureDriven ? 0 : foldEdges),
+        "cloth fold forced a grid axis, or protected control lost its axis");
+    if (curvatureDriven) {
+        // A nearby interior sample is not curve-bound, but its source walk
+        // must still respect a protected fold that does not force a grid axis.
+        const V inner = (p[15] + p[18]) * .5, outer = (p[17] + p[20]) * .5;
+        // Barycentric in triangle (15, 19, 16), even when the band twists.
+        std::vector<V> output = { .8 * midpoint + .2 * p[15], p[17], p[20] };
+        const auto before = output;
+        require(analysis.bindCurve(output[0], .02).chain == SurfaceMesh::npos,
+            "fold relaxation sample was unexpectedly curve-bound");
+        analysis.relaxSurface(output, { { 1, 2 }, { 0, 2 }, { 0, 1 } },
+            { false, true, true }, { { 0, 1, 2 } }, 5);
+        require(V::dotProduct(output[0] - midpoint, outer - inner) <= 1e-12,
+            "relaxation crossed a protected nondirectional fold");
+        require(analysis.surfaceDistanceSquared(output[0]) < 1e-20,
+            "protected-fold relaxation left the source surface");
+        require(V::dotProduct(V::crossProduct(before[1] - before[0], before[2] - before[0]),
+                    V::crossProduct(output[1] - output[0], output[2] - output[0])) > 0,
+            "protected-fold relaxation reversed an incident face");
+        require((output[1] - before[1]).length() < 1e-12 && (output[2] - before[2]).length() < 1e-12,
+            "protected-fold relaxation moved locked neighbors");
+    }
+}
+
+static void supportedBend()
+{
+    // A gently curved strip approaches a smooth 103-degree bend. The bend
+    // first enters the widest support at row 48: finer radii see only the
+    // gentle background. That supported sample should affect spacing while
+    // remaining a soft guide, since adjacent scales do not confirm it yet.
+    const size_t columns = 101, rows = 21, shoulder = 48 * 40 + 20;
+    for (double scale : { 1., 7. }) {
+        std::vector<std::vector<size_t>> triangles;
+        for (size_t i = 0; i + 1 < columns; ++i)
+            for (size_t j = 0; j + 1 < rows; ++j) {
+                const size_t a = i * rows + j, b = a + rows;
+                triangles.push_back({ a, b, b + 1 });
+                triangles.push_back({ a, b + 1, a + 1 });
+            }
+        const auto strip = [&](bool bend) {
+            std::vector<V> points;
+            double x = 0, z = 0, previous = 0;
+            for (size_t i = 0; i < columns; ++i) {
+                const double s = -.2 + .004 * i;
+                const double angle = 2 * s + (bend ? .9 * (1 + std::tanh((s - .06) / .01)) : 0);
+                if (i) {
+                    x += .004 * std::cos((angle + previous) * .5);
+                    z += .004 * std::sin((angle + previous) * .5);
+                }
+                previous = angle;
+                for (size_t j = 0; j < rows; ++j) {
+                    const double y = .1 * (double(j) - 10);
+                    points.push_back(scale * (scale == 1 ? V(x, y, z) : V(x, z, -y)));
+                }
+            }
+            return points;
+        };
+        SurfaceMesh curvedMesh(strip(true), triangles), gentleMesh(strip(false), triangles);
+        SurfaceAnalysis curved(curvedMesh, .05 * scale, 90, 1, 1, true, true, true, nullptr, true);
+        SurfaceAnalysis gentle(gentleMesh, .05 * scale, 90, 1, 1, true, true, true, nullptr, true);
+        const auto& guide = curved.faces()[shoulder];
+        const auto& background = gentle.faces()[shoulder];
+        require(background.scale == 1 && background.major * scale < 3,
+            "gentle control acquired bend density");
+        require(guide.major > 3 * background.major && guide.scale < .98 && guide.ratio < .98,
+            "supported bend was discarded for under-resolved background curvature");
+        require(guide.confidence > 0 && guide.confidence < 1,
+            "one supported scale became a fixed curvature root");
+        require(curved.faces()[65 * 40 + 20].confidence == 1,
+            "bend interior lost its confirmed curvature root");
+    }
+}
+
+static void sourceFlow()
+{
+    const std::vector<std::vector<size_t>> triangles { { 0, 1, 2 }, { 0, 2, 3 } };
+    for (double scale : { 1., 7. }) {
+        const auto transform = [&](V v) { return scale * (scale == 1 ? v : V(v.z(), v.x(), v.y())); };
+        std::vector<V> source;
+        for (V v : { V(-1, -1, 0), V(1, -1, 0), V(1, 1, 0), V(-1, 1, 0) })
+            source.push_back(transform(v));
+        SurfaceAnalysis reference(SurfaceMesh(source, triangles), .1 * scale, 90, 0, 0, true);
+        std::vector<SurfaceGuidance::Face> flow(2);
+        for (auto& face : flow) {
+            face.direction = transform(V(1, 0, 0));
+            face.confidence = 1;
+        }
+        struct Grid { std::vector<V> points; std::vector<std::vector<size_t>> faces; };
+        const auto grid = [&](size_t nx, size_t ny, double angle, double right = 2.) {
+            Grid result;
+            for (size_t j = 0; j <= ny; ++j)
+                for (size_t i = 0; i <= nx; ++i) {
+                    const double x = -2 + (right + 2) * i / nx, y = -2 + 4. * j / ny;
+                    result.points.push_back(transform(V(std::cos(angle) * x - std::sin(angle) * y,
+                        std::sin(angle) * x + std::cos(angle) * y, 0)));
+                }
+            for (size_t j = 0; j < ny; ++j)
+                for (size_t i = 0; i < nx; ++i) {
+                    const size_t a = j * (nx + 1) + i;
+                    result.faces.push_back({ a, a + 1, a + nx + 2, a + nx + 1 });
+                }
+            return result;
+        };
+        // Analytic directions isolate layout scoring from curvature estimation.
+        // Rotating/subdividing the same regular grid must not buy better flow.
+        for (double angle : { 0., M_PI / 4, M_PI / 15 })
+            for (size_t nx : { size_t(1), size_t(8), size_t(3) }) {
+                const auto output = grid(nx, nx == 3 ? 12 : nx, angle);
+                const auto fit = reference.measureLayoutFit(output.points, output.faces, &flow);
+                require(std::fabs(fit.flowError - std::pow(std::sin(2 * angle), 2)) < 1e-12,
+                    "flow depends on subdivision, aspect, world rotation or scale");
+                require(std::fabs(fit.flowWeight - 4 * scale * scale) < 1e-10,
+                    "candidate density changed source flow weight");
+            }
+        auto output = grid(8, 8, M_PI / 15);
+        for (auto& face : output.faces) std::reverse(face.begin(), face.end());
+        for (V axis : { V(-1, 0, 0), V(0, 1, 0) }) {
+            for (auto& face : flow) face.direction = transform(axis);
+            require(std::fabs(reference.measureLayoutFit(output.points, output.faces, &flow).flowError - std::pow(std::sin(2 * M_PI / 15), 2)) < 1e-12,
+                "axis sign, quarter turn or polygon winding changed cross flow");
+        }
+        const auto missing = grid(4, 4, 0, 0);
+        const auto fit = reference.measureLayoutFit(missing.points, missing.faces, &flow);
+        require(std::fabs(fit.flowWeight - 4 * scale * scale) < 1e-10 && fit.flowError < 1e-12,
+            "missing aligned strip changed source weighting");
+        require(std::fabs(fit.missingError - scale * scale / 18) < 1e-10,
+            "flow scoring hid a missing strip from the existing fitting measure");
+        require(fit.missingError == reference.missingSurfaceError(missing.points, missing.faces),
+            "optional flow changed geometric fitting");
+        const auto flat = reference.measureLayoutFit(output.points, output.faces, &reference.faces());
+        require(flat.flowWeight == 0 && flat.flowError == 0, "flat source invented directional evidence");
+        for (auto& face : flow) face.direction = V();
+        const auto zero = reference.measureLayoutFit(output.points, output.faces, &flow);
+        require(zero.flowWeight == 0 && zero.flowError == 0, "zero direction did not fall back to geometry");
+    }
+}
+
+static void invalidFlowFit()
+{
+    const std::vector<V> source { V(-1, -1, 0), V(1, -1, 0), V(1, 1, 0), V(-1, 1, 0) };
+    SurfaceAnalysis reference(SurfaceMesh(source, { { 0, 1, 2 }, { 0, 2, 3 } }), .1, 90, 0, 0, false, false);
+    const std::vector<std::vector<size_t>> quad { { 0, 1, 2, 3 } };
+    std::vector<SurfaceGuidance::Face> flow(2);
+    for (auto& face : flow) { face.direction = V(1, 0, 0); face.confidence = 1; }
+    auto far = source;
+    for (auto& v : far) v += V(1e200, 1e200, 1e200);
+    require(std::isinf(reference.measureLayoutFit(far, quad, &flow).flowError),
+        "failed nearest-face lookup did not fail closed");
+    auto nonfinite = source;
+    nonfinite[0] = V(std::numeric_limits<double>::quiet_NaN(), 0, 0);
+    require(std::isinf(reference.measureLayoutFit(nonfinite, quad, &flow).flowError),
+        "nonfinite output geometry has a finite flow score");
+    require(std::isinf(reference.measureLayoutFit(source, { { 0, 1, 2, 4 } }, &flow).flowError),
+        "invalid output indices reached the candidate BVH");
+}
+
+static void coherentQuadRelaxation()
+{
+    // A thin warped quad with a closed one-ring around its only movable vertex.
+    for (double scale : { .25, 1., 7. })
+        for (bool rotate : { false, true })
+            for (double fraction : { .1, .3, 1. }) {
+                std::vector<V> points = {
+                    { .08610773016252324, -.43752701009304035, .24165775902321926 },
+                    { -.11330633235041171, .39788264620953756, -.23873349134840416 },
+                    { -.12217656198252361, .4308693265025071, -.25167236535143317 },
+                    { .14937516417041208, -.39122496261897316, .24874809767661804 }
+                };
+                const V goal(-.12647046828443562, .4284101238856443, -.2570446132709799);
+                const V normal(.7874016444877138, -.029775616421176657, -.615720767007889);
+                const V tangent = (goal - points[2]).normalized();
+                const V across = V::crossProduct(normal, tangent).normalized();
+                const V wanted = points[2] + fraction * (goal - points[2]);
+                // Supporting neighbors prescribe the undamped mean; projection stays on one sheet.
+                V center = ((2 * wanted - points[2]) * 4 - points[1] - points[3]) * .5;
+                center = center - normal * V::dotProduct(center - points[2], normal);
+                points.push_back(center - .5 * across);
+                points.push_back(center + .5 * across);
+                std::vector<V> source = { points[2] - 10 * tangent - 10 * across,
+                    points[2] + 20 * tangent - 10 * across, points[2] - 10 * tangent + 20 * across };
+                auto transform = [&](const V& p) { return scale * (rotate ? V(p.z(), p.x(), p.y()) : p); };
+                for (auto& p : points)
+                    p = transform(p);
+                for (auto& p : source)
+                    p = transform(p);
+                const std::vector<std::vector<size_t>> polygons = { { 0, 1, 2, 3 }, { 2, 1, 4 }, { 2, 4, 5 }, { 2, 5, 3 } };
+                std::vector<std::unordered_set<size_t>> neighbors(points.size());
+                for (const auto& polygon : polygons)
+                    for (size_t i = 0; i < polygon.size(); ++i) {
+                        size_t a = polygon[i], b = polygon[(i + 1) % polygon.size()];
+                        neighbors[a].insert(b);
+                        neighbors[b].insert(a);
+                    }
+                const auto before = points;
+                SurfaceAnalysis analysis(SurfaceMesh(source, { { 0, 1, 2 } }), scale, 90, 0, 0, false, false, false, nullptr, true);
+                for (size_t start = 0; start < 4; ++start) {
+                    auto cyclic = polygons;
+                    std::rotate(cyclic[0].begin(), cyclic[0].begin() + start, cyclic[0].end());
+                    auto output = before;
+                    analysis.relaxSurface(output, neighbors, { true, true, false, true, true, true }, cyclic, 1);
+                    const V expected = fraction < 1 ? transform(wanted) : before[2];
+                    require((output[2] - expected).length() < 1e-10 * scale,
+                        "quad start changed acceptance of a valid concave or invalid move");
+                    for (size_t i = 0; i < output.size(); ++i)
+                        if (i != 2)
+                            require((output[i] - before[i]).length() == 0, "surface relaxation moved a locked support");
+                    if (fraction < 1)
+                        require((output[2] - before[2]).length() > 1e-5 * scale, "quad safeguard disabled valid smoothing");
+                }
+            }
+}
+
+
+
+static void semanticCurvePaths()
+{
+    // Geometric corner splits must not hide a weak open path's short bridge.
+    // A loop assembled from open pieces still has no semantic endpoints.
+    for (bool closed : { false, true })
+        for (double degrees : { 38., 100. })
+            for (double scale : { 1., 7. }) {
+                const double width = closed ? .2 : .01;
+                const double height = width * std::tan(degrees * M_PI / 360);
+                const std::vector<V> centers = closed
+                    ? std::vector<V>{ V(-1, -1, 0), V(1, -1, 0), V(1, 1, 0), V(-1, 1, 0) }
+                    : std::vector<V>{ V(0, 0, 0), V(1, 0, 0), V(1, .1, 0), V(0, .1, 0) };
+                const std::vector<V> offsets = closed ? centers
+                    : std::vector<V>{ V(0, 1, 0), V(-1, 1, 0), V(-1, -1, 0), V(0, -1, 0) };
+                auto transform = [&](const V& v) { return scale * (scale == 1 ? v : V(v.z(), v.x(), v.y())); };
+                std::vector<V> points;
+                std::vector<std::vector<size_t>> triangles;
+                for (size_t i = 0; i < centers.size(); ++i)
+                    for (int j = -1; j <= 1; ++j)
+                        points.push_back(transform(centers[i] + width * j * offsets[i] + V(0, 0, height * std::abs(j))));
+                for (size_t i = 0; i < (closed ? 4 : 3); ++i)
+                    for (size_t j = 0; j < 2; ++j) {
+                        const size_t a = 3 * i + j, b = 3 * ((i + 1) % 4) + j;
+                        triangles.push_back({ a, b, b + 1 });
+                        triangles.push_back({ a, b + 1, a + 1 });
+                    }
+                SurfaceMesh mesh(points, triangles);
+                SurfaceAnalysis analysis(mesh, .2 * scale, 90, 1, 1, true, true, false, nullptr, true);
+                const auto guidance = analysis.transfer(mesh, true);
+                size_t weak = 0;
+                for (const auto& chain : analysis.chains()) {
+                    if (chain.strength > 0 && chain.strength < 1) {
+                        ++weak;
+                        require(chain.directional == closed, "semantic path direction ignored its open/closed topology");
+                    }
+                    if (chain.strength >= 1)
+                        require(chain.directional, "semantic grouping removed a hard crease or border direction");
+                    for (size_t c : chain.corners) {
+                        const bool selected = chain.strength > 0 && chain.directional;
+                        require(bool(guidance.featureCorners[c]) == selected, "semantic direction did not reach corner guidance");
+                        if (mesh.oppositeCorner(c) != SurfaceMesh::npos)
+                            require(guidance.featureCorners[c] == guidance.featureCorners[mesh.oppositeCorner(c)], "semantic path made asymmetric edge constraints");
+                    }
+                }
+                require(weak == (degrees > 90 ? 0 : closed ? 4 : 2), "semantic grouping changed geometric feature retention");
+                const V midpoint = closed ? V(0, -1, 0) : V(.5, 0, 0);
+                const auto binding = analysis.bindCurve(transform(midpoint), .001 * scale);
+                require(binding.chain != SurfaceMesh::npos, "semantic grouping removed geometric curve binding");
+                const V along = midpoint + V(.1, 0, 0);
+                require((analysis.projectCurve(binding, transform(along + V(0, .001, .001))) - transform(along)).length() < 1e-10 * scale,
+                    "semantic grouping changed curve projection ownership");
+                if (!closed && degrees < 90)
+                    require(analysis.bindCurve(transform(V(1, .05, 0)), .001 * scale).chain == SurfaceMesh::npos,
+                        "semantic grouping reactivated the unsupported geometric bridge");
+            }
+}
+
+
+static void semanticPathGuards()
+{
+    // Two long automatic arms meet across two unsupported short side branches.
+    // Varying the arm dihedrals distinguishes a protected bend from a strong crease.
+    for (double degrees : { 75., 100. }) {
+        const double h = .01 * std::tan(degrees * M_PI / 360);
+        const V a(-1, 0, 0), b(std::cos(50 * M_PI / 180), std::sin(50 * M_PI / 180), 0);
+        const V c(0, .01, h), d(0, -.01, h);
+        const std::vector<V> points = { V(), c, d, a, b, a + c, a + d, b + c, b + d };
+        const std::vector<std::vector<size_t>> triangles = {
+            { 3, 0, 1 }, { 3, 1, 5 }, { 3, 2, 0 }, { 3, 6, 2 },
+            { 0, 4, 1 }, { 4, 7, 1 }, { 0, 2, 4 }, { 4, 2, 8 }
+        };
+        SurfaceMesh mesh(points, triangles);
+        SurfaceAnalysis analysis(mesh, .2, 150, 1, 1, true, true, false, nullptr, true);
+        size_t arms = 0, branches = 0;
+        for (const auto& chain : analysis.chains())
+            if (!mesh.isBoundaryCorner(chain.corners.front())) {
+                if (chain.strength > 0 && chain.strength < 1) {
+                    ++arms;
+                    require(chain.directional == (degrees > 90), "semantic grouping confused a strong crease with a protected bend");
+                } else if (chain.strength == 0) {
+                    ++branches;
+                }
+            }
+        require(arms == 2 && branches == 2, "semantic grouping changed arm or unsupported branch retention");
+    }
+}
+
 int main()
 {
     try {
+        rimWorkflow();
+        semanticPathGuards();
+        semanticCurvePaths();
+        coherentQuadRelaxation();
+        sourceFlow();
+        invalidFlowFit();
+        competingFold();
+        supportedBend();
+        foldedStrip(false);
+        foldedStrip(true, true);
+        foldedStrip(true);
+        foldedStrip(true, false, true);
         residualHoles();
         roundRimRecovery();
         missingSurface();

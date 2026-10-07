@@ -34,6 +34,7 @@ add_test(NAME preparation_reference COMMAND reference_surface_test)
 
 add_executable(surface_analysis_test surface_analysis_test.cpp
     "${UPSTREAM}/src/AutoRemesher/surfaceanalysis.cpp"
+    "${UPSTREAM}/src/AutoRemesher/surfacerelaxation.cpp"
     "${UPSTREAM}/src/AutoRemesher/surfacemesh.cpp"
     "${UPSTREAM}/thirdparty/isotropicremesher/axisalignedboundingboxtree.cpp")
 target_include_directories(surface_analysis_test PRIVATE
@@ -41,3 +42,11 @@ target_include_directories(surface_analysis_test PRIVATE
     "${UPSTREAM}/thirdparty/isotropicremesher")
 target_link_libraries(surface_analysis_test PRIVATE TBB::tbb)
 add_test(NAME surface_analysis COMMAND surface_analysis_test)
+
+add_executable(surface_relaxation_test surface_relaxation_test.cpp
+    "${UPSTREAM}/src/AutoRemesher/surfacerelaxation.cpp"
+    "${UPSTREAM}/thirdparty/isotropicremesher/axisalignedboundingboxtree.cpp")
+target_include_directories(surface_relaxation_test PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/overlay" "${UPSTREAM}/thirdparty/eigen"
+    "${UPSTREAM}/thirdparty/isotropicremesher")
+add_test(NAME surface_relaxation COMMAND surface_relaxation_test)

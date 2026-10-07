@@ -37,6 +37,7 @@ public:
         AutoRemesher::ModelType modelType = AutoRemesher::ModelType::Organic;
         double adaptivity = 1.0;
         double anisotropy = 1.0;
+        bool clothFoldGuidance = false;
         double sharpEdgeDegrees = 90.0;
         double smoothNormalDegrees = 0.0;
     };

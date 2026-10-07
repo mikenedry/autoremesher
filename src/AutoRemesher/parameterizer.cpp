@@ -181,9 +181,21 @@ bool Parameterizer::parameterize(bool featureLayout)
             m_sharpEdgeDegrees, m_adaptivity, m_anisotropy));
     const SurfaceAnalysis& analysis = m_analysis ? *m_analysis : *localAnalysis;
     SurfaceGuidance guidance;
+    m_relaxationMetric.clear();
     if (analysis.featureLayout()) {
         SurfaceAnalysis measured(topology, analysis.length(), m_sharpEdgeDegrees, m_adaptivity, m_anisotropy,
-            true, true, m_spacingRefinement);
+            true, true, m_spacingRefinement, &analysis);
+        if (analysis.openFoldWorkflow())
+            m_relaxationMetric.resize(topology.faceCount());
+        for (size_t f = 0; f < m_relaxationMetric.size(); ++f) {
+            const auto& curvature = measured.faces()[f];
+            auto& metric = m_relaxationMetric[f];
+            // Capture strict curvature before features replace alignment confidence.
+            metric.strictCurvature = curvature.confidence == 1.;
+            const double major = std::fabs(curvature.major), minor = std::fabs(curvature.minor);
+            metric.anisotropy = metric.strictCurvature && major > 0 ?
+                std::max(0., std::min(1., (major - minor) / major)) : 0.;
+        }
         guidance = measured.transfer(topology, true);
         for (size_t f = 0; f < topology.faceCount(); ++f)
             if (guidance.featureCorners[3 * f] || guidance.featureCorners[3 * f + 1] || guidance.featureCorners[3 * f + 2])
@@ -206,7 +218,7 @@ bool Parameterizer::parameterize(bool featureLayout)
     if (nullptr != m_triangleFieldVectors) {
         field = *m_triangleFieldVectors;
     } else if (!FrameField::create(topology, m_sharpEdgeDegrees,
-                   &field, &guidance, analysis.featureLayout())) {
+                   &field, &guidance, analysis.featureLayout(), analysis.openFoldWorkflow())) {
         std::cerr << "Frame field solve failed" << std::endl;
         return false;
     }
@@ -249,9 +261,17 @@ bool Parameterizer::parameterize(bool featureLayout)
             &field, m_scaling, m_sharpEdgeDegrees, &cover,
             &faceScalingField, &faceScalingU, &faceScalingV,
             coverProgress ? &coverProgress : nullptr, &guidance.featureCorners, featureLayout || analysis.featureLayout(),
-            m_spacingRefinement && analysis.featureLayout() && adaptive > 0 ? &guidance : nullptr, analysis.supportsRimConstraints())) {
+            m_spacingRefinement && analysis.featureLayout() && adaptive > 0 ? &guidance : nullptr,
+            analysis.supportsRimConstraints(), analysis.openFoldWorkflow())) {
         std::cerr << "Quad cover solve failed" << std::endl;
         return false;
+    }
+
+    for (size_t f = 0; f < m_relaxationMetric.size(); ++f) {
+        auto& metric = m_relaxationMetric[f];
+        metric.direction = cover.field[f];
+        metric.spacingU = cover.physicalSpacing[f].x();
+        metric.spacingV = cover.physicalSpacing[f].y();
     }
 
     report(0.99f, "Collecting singularities");

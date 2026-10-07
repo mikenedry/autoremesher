@@ -49,6 +49,20 @@
 namespace AutoRemesher {
 
 namespace {
+    Vector2 interpolateUv(const Vector2& from, const Vector2& to, double ratio, bool preserveConstant)
+    {
+        if (!preserveConstant)
+            return from * (1 - ratio) + to * ratio;
+        if (ratio == 0)
+            return from;
+        if (ratio == 1)
+            return to;
+        // A collapsed UV coordinate must remain exactly constant.
+        const auto result = from * (1 - ratio) + to * ratio;
+        return Vector2(from.x() == to.x() ? from.x() : result.x(),
+            from.y() == to.y() ? from.y() : result.y());
+    }
+
     bool hasRepeatedVertex(const std::vector<size_t>& face)
     {
         // Most cleanup faces are small; avoid allocating a hash table for them.
@@ -61,6 +75,67 @@ namespace {
         }
         const std::unordered_set<size_t> vertices(face.begin(), face.end());
         return vertices.size() != face.size();
+    }
+
+    bool crossesPlanarFace(const std::vector<Vector3>& points,
+        const std::vector<size_t>& polygon, size_t first, size_t second)
+    {
+        const auto a = std::find(polygon.begin(), polygon.end(), first);
+        const auto b = std::find(polygon.begin(), polygon.end(), second);
+        if (a == polygon.end() || b == polygon.end())
+            return false;
+        const size_t i = a - polygon.begin(), j = b - polygon.begin();
+        if ((i + 1) % polygon.size() == j || (j + 1) % polygon.size() == i)
+            return false;
+        // Only certify overlap in a plane. Subtracting an origin avoids
+        // cancellation in the area normal; tolerate only floating-point noise.
+        const auto origin = points[polygon[0]];
+        Vector3 normal;
+        double extent = 0, coordinateScale = 0;
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            const auto& p = points[polygon[i]];
+            normal += Vector3::crossProduct(p - origin,
+                points[polygon[(i + 1) % polygon.size()]] - origin);
+            extent = std::max(extent, (p - origin).length());
+            for (size_t axis = 0; axis < 3; ++axis)
+                coordinateScale = std::max(coordinateScale, std::fabs(p[axis]));
+        }
+        const double tolerance = 64 * std::numeric_limits<double>::epsilon()
+            * polygon.size() * (coordinateScale + extent);
+        const double normalLength = normal.length();
+        if (!(normalLength > tolerance * extent))
+            return false;
+        normal /= normalLength;
+        for (size_t vertex : polygon)
+            if (std::fabs(Vector3::dotProduct(points[vertex] - origin, normal)) > tolerance)
+                return false;
+
+        size_t drop = 0;
+        for (size_t axis = 1; axis < 3; ++axis)
+            if (std::fabs(normal[axis]) > std::fabs(normal[drop]))
+                drop = axis;
+        const size_t x = (drop + 1) % 3, y = (drop + 2) % 3;
+        const auto midpoint = ((points[first] - origin)
+            + (points[second] - origin)) * .5;
+        bool inside = false, onBoundary = false;
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            const auto a = points[polygon[i]] - origin;
+            const auto b = points[polygon[(i + 1) % polygon.size()]] - origin;
+            const double dx = b[x] - a[x], dy = b[y] - a[y];
+            const double cross = dx * (midpoint[y] - a[y]) - dy * (midpoint[x] - a[x]);
+            if (std::fabs(cross) <= tolerance * std::hypot(dx, dy)
+                && midpoint[x] >= std::min(a[x], b[x]) - tolerance
+                && midpoint[x] <= std::max(a[x], b[x]) + tolerance
+                && midpoint[y] >= std::min(a[y], b[y]) - tolerance
+                && midpoint[y] <= std::max(a[y], b[y]) + tolerance) {
+                onBoundary = true;
+                break;
+            }
+            if ((a[y] > midpoint[y]) != (b[y] > midpoint[y])
+                && midpoint[x] < a[x] + (midpoint[y] - a[y]) * dx / dy)
+                inside = !inside;
+        }
+        return inside && !onBoundary;
     }
 
     std::vector<size_t> canonicalFace(const std::vector<size_t>& face)
@@ -385,6 +460,22 @@ void QuadExtractor::restoreBoundary()
         if (closed)
             std::cerr << "Final hole repair: " << closed << " loops\n";
     }
+    if (!m_analysis || !m_analysis->openFoldWorkflow())
+        return;
+    // Projection and cleanup can collapse an entire polygon onto a curve.
+    // Remove only zero-area faces; arbitrarily thin valid cells still survive.
+    const size_t before = m_remeshedPolygons.size();
+    m_remeshedPolygons.erase(std::remove_if(m_remeshedPolygons.begin(), m_remeshedPolygons.end(), [&](const auto& face) {
+        for (size_t k = 1; k + 1 < face.size(); ++k) {
+            const auto normal = Vector3::crossProduct(m_remeshedVertices[face[k]] - m_remeshedVertices[face[0]],
+                m_remeshedVertices[face[k + 1]] - m_remeshedVertices[face[0]]);
+            if (normal.x() != 0 || normal.y() != 0 || normal.z() != 0)
+                return false;
+        }
+        return true;
+    }), m_remeshedPolygons.end());
+    if (m_remeshedPolygons.size() != before)
+        rebuildHalfEdges();
 }
 
 void QuadExtractor::simplifyGraph(std::unordered_map<size_t, std::unordered_set<size_t>>& graph,
@@ -686,7 +777,15 @@ void QuadExtractor::extractMesh(std::vector<Vector3>& points,
 
     std::set<std::tuple<size_t, size_t, size_t>> corners;
     auto& halfEdges = m_halfEdges;
+    const bool checkFaceInteriors = m_analysis && m_analysis->openFoldWorkflow();
+    std::unordered_map<size_t, std::vector<size_t>> acceptedFacesAtVertex;
     auto isConerUsed = [&](size_t previous, size_t current, size_t next) {
+        // Open folds may need both cells along a subdivided graph edge.
+        // Keep the existing corner reservations for the other workflows.
+        const auto node = edgeConnectMap.find(current);
+        if (m_analysis && m_analysis->openFoldWorkflow()
+            && node != edgeConnectMap.end() && node->second.size() == 2)
+            return false;
         if (corners.end() != corners.find(std::make_tuple(previous, current, next)))
             return true;
         if (corners.end() != corners.find(std::make_tuple(next, current, previous)))
@@ -700,6 +799,15 @@ void QuadExtractor::extractMesh(std::vector<Vector3>& points,
             if (isConerUsed(vertices[i], vertices[j], vertices[k]))
                 return true;
         }
+        if (checkFaceInteriors)
+            for (size_t i = 0; i < vertices.size(); ++i) {
+                const size_t a = vertices[i], b = vertices[(i + 1) % vertices.size()];
+                const auto owners = acceptedFacesAtVertex.find(a);
+                if (owners != acceptedFacesAtVertex.end())
+                    for (size_t face : owners->second)
+                        if (crossesPlanarFace(points, (*quads)[face], a, b))
+                            return true;
+            }
         return false;
     };
     auto addFaceCorners = [&](const std::vector<size_t>& vertices) {
@@ -722,6 +830,8 @@ void QuadExtractor::extractMesh(std::vector<Vector3>& points,
         for (size_t i = 0; i < vertices.size(); ++i) {
             size_t j = (i + 1) % vertices.size();
             halfEdges.insert({ vertices[i], vertices[j] });
+            if (checkFaceInteriors)
+                acceptedFacesAtVertex[vertices[i]].push_back(quads->size() - 1);
         }
     };
 
@@ -1011,7 +1121,8 @@ void QuadExtractor::extractConnections(std::vector<Vector3>* crossPoints,
                         }
                         CrossPoint point;
                         point.position3 = (*m_vertices)[cornerIndices[fromIndex]] * (1 - ratio) + (*m_vertices)[cornerIndices[toIndex]] * ratio;
-                        point.position2 = cornerUvs[fromIndex] * (1 - ratio) + cornerUvs[toIndex] * ratio;
+                        point.position2 = interpolateUv(cornerUvs[fromIndex], cornerUvs[toIndex], ratio,
+                            m_analysis && m_analysis->openFoldWorkflow());
                         point.integer = integer;
                         points[integer].push_back(point);
                     }
@@ -1035,11 +1146,26 @@ void QuadExtractor::extractConnections(std::vector<Vector3>* crossPoints,
             for (const auto& targetIt : lines[i]) {
                 for (const auto& target : targetIt.second) {
                     std::vector<std::vector<CrossPoint>> segments = { target };
+                    // Conservative upper bound for all segments except the last.
+                    // Keep chained interpolation and the original append order.
+                    double prefixUpperBound = -std::numeric_limits<double>::infinity();
+                    auto includePrefixSegment = [&](const std::vector<CrossPoint>& segment) {
+                        for (const auto& point : segment) {
+                            const double coordinate = point.position2[j];
+                            if (std::isnan(coordinate))
+                                prefixUpperBound = std::numeric_limits<double>::quiet_NaN();
+                            else if (coordinate > prefixUpperBound)
+                                prefixUpperBound = coordinate;
+                        }
+                    };
                     for (const auto& splitIt : lines[j]) {
                         const auto& split = splitIt.second.begin();
                         const auto& coordIndex = j;
                         double segmentPosition = split[0][0].position2[coordIndex];
-                        for (int segmentIndex = (int)segments.size() - 1; segmentIndex >= 0; --segmentIndex) {
+                        const int lastSegmentIndex = (int)segments.size() - 1;
+                        const int firstSegmentIndex = lastSegmentIndex >= 0 && segmentPosition > prefixUpperBound
+                            ? lastSegmentIndex : 0;
+                        for (int segmentIndex = lastSegmentIndex; segmentIndex >= firstSegmentIndex; --segmentIndex) {
                             auto& segment = segments[segmentIndex];
                             double fromPosition;
                             double toPosition;
@@ -1066,7 +1192,8 @@ void QuadExtractor::extractConnections(std::vector<Vector3>* crossPoints,
                             double ratio = (segmentPosition - fromPosition) / distance;
                             //std::cerr << "Split at ratio:" << ratio << std::endl;
                             Vector3 position3 = segment[fromIndex].position3 * (1 - ratio) + segment[toIndex].position3 * ratio;
-                            Vector2 position2 = segment[fromIndex].position2 * (1 - ratio) + segment[toIndex].position2 * ratio;
+                            Vector2 position2 = interpolateUv(segment[fromIndex].position2, segment[toIndex].position2, ratio,
+                                m_analysis && m_analysis->openFoldWorkflow());
                             int integer = segment[toIndex].integer;
                             CrossPoint newFromPoint;
                             newFromPoint.position3 = position3;
@@ -1074,6 +1201,10 @@ void QuadExtractor::extractConnections(std::vector<Vector3>* crossPoints,
                             newFromPoint.integer = integer;
                             CrossPoint newToPoint = segment[toIndex];
                             segment[toIndex] = newFromPoint;
+                            // Both modified segment and previous tail will belong
+                            // to the prefix after appending, even on a fallback scan.
+                            includePrefixSegment(segment);
+                            includePrefixSegment(segments.back());
                             segments.push_back({ newFromPoint, newToPoint });
                         }
                     }
@@ -1937,7 +2068,13 @@ void QuadExtractor::smoothAndProject(size_t iterations,
     }
 
     if (m_analysis) {
-        m_analysis->relaxSurface(m_remeshedVertices, neighbors, locked, m_remeshedPolygons, iterations);
+        std::vector<SurfaceRelaxationStencil> stencils;
+        if (!movableVertices && m_triangleUvs && m_relaxationMetric
+            && !m_relaxationMetric->empty())
+            stencils = buildSurfaceRelaxationStencils(*m_vertices, *m_triangles,
+                *m_triangleUvs, *m_relaxationMetric, m_remeshedVertices, m_remeshedPolygons, &edgeUseCount);
+        m_analysis->relaxSurface(m_remeshedVertices, neighbors, locked, m_remeshedPolygons,
+            iterations, stencils.empty() ? nullptr : &stencils);
         return;
     }
     std::vector<::Vector3> targetVertices;
@@ -2078,6 +2215,22 @@ void QuadExtractor::splitSixEdgeFaces()
         return -total / quad.size();
     };
 
+    const auto coherentChild = [&](const std::vector<size_t>& quad, const Vector3& parentNormal) {
+        for (size_t offset = 0; offset < 2; ++offset) {
+            const auto& a = m_remeshedVertices[quad[offset]];
+            const auto& b = m_remeshedVertices[quad[(offset + 1) % 4]];
+            const auto& c = m_remeshedVertices[quad[(offset + 2) % 4]];
+            const auto& d = m_remeshedVertices[quad[(offset + 3) % 4]];
+            const auto first = Vector3::crossProduct(b - a, c - a);
+            const auto second = Vector3::crossProduct(c - a, d - a);
+            const auto sum = first + second;
+            if (Vector3::dotProduct(first, parentNormal) > 0 && Vector3::dotProduct(second, parentNormal) > 0
+                && Vector3::dotProduct(first, sum) > 0 && Vector3::dotProduct(second, sum) > 0)
+                return true;
+        }
+        return false;
+    };
+
     size_t splitNum = 0;
     std::vector<std::vector<size_t>> polygons;
     polygons.reserve(m_remeshedPolygons.size());
@@ -2092,6 +2245,10 @@ void QuadExtractor::splitSixEdgeFaces()
             continue;
         }
 
+        Vector3 parentNormal;
+        for (size_t k = 1; k + 1 < face.size(); ++k)
+            parentNormal += Vector3::crossProduct(m_remeshedVertices[face[k]] - m_remeshedVertices[face[0]],
+                m_remeshedVertices[face[k + 1]] - m_remeshedVertices[face[0]]);
         int bestCorner = -1;
         double bestScore = 0.0;
         for (size_t i = 0; i < 3; ++i) {
@@ -2102,6 +2259,11 @@ void QuadExtractor::splitSixEdgeFaces()
                 && findNeighbors->second.end() != findNeighbors->second.find(b)) {
                 continue;
             }
+            const std::vector<size_t> first { face[i], face[(i + 1) % 6], face[(i + 2) % 6], face[i + 3] };
+            const std::vector<size_t> second { face[i + 3], face[(i + 4) % 6], face[(i + 5) % 6], face[i] };
+            if (m_analysis && m_analysis->openFoldWorkflow()
+                && (!coherentChild(first, parentNormal) || !coherentChild(second, parentNormal)))
+                continue;
             auto direction = (m_remeshedVertices[b] - m_remeshedVertices[a]).normalized();
             std::unordered_set<size_t> aFaceNeighbors = {
                 face[(i + 5) % 6], face[(i + 1) % 6], b
@@ -4812,9 +4974,29 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
         const size_t keep = sharedEdge.first;
         const size_t remove = sharedEdge.second;
         const size_t unmovedVertex = m_remeshedVertices.size();
-        const Vector3 keepPosition = (m_remeshedVertices[keep]
-                                         + m_remeshedVertices[remove])
+        Vector3 keepPosition = (m_remeshedVertices[keep]
+                                  + m_remeshedVertices[remove])
             * 0.5;
+        if (m_analysis && m_analysis->openFoldWorkflow()) {
+            const auto binding = [&](size_t vertex) {
+                double radius = m_analysis->length();
+                for (size_t neighbor : vertexNeighbors[vertex])
+                    radius = std::min(radius, (m_remeshedVertices[vertex] - m_remeshedVertices[neighbor]).length());
+                return m_analysis->bindCurve(m_remeshedVertices[vertex], .1 * radius);
+            };
+            const auto a = binding(keep), b = binding(remove);
+            const size_t none = SurfaceMesh::npos;
+            if ((a.chain != none && b.chain != none && a.chain != b.chain)
+                || (a.vertex != none && b.vertex != none && a.vertex != b.vertex)) {
+                rejectedEdges.insert(sharedEdge);
+                continue;
+            }
+            // Minimize the collapse displacement while retaining an existing curve
+            // or fixed source corner. Unbound endpoints retain the ordinary midpoint.
+            const auto& curve = a.vertex != none ? a : b.vertex != none ? b : a.chain != none ? a : b;
+            if (curve.chain != none)
+                keepPosition = m_analysis->projectCurve(curve, keepPosition);
+        }
         std::vector<std::vector<size_t>> rewritten;
         std::vector<bool> affected;
         std::vector<size_t> changedFaces;
@@ -4849,6 +5031,21 @@ void QuadExtractor::mergeSharedFiveEdgeFaces(const ProgressHandler* progressHand
                 if (hasRepeatedVertex(candidate)) {
                     valid = false;
                     break;
+                }
+                if (m_analysis && m_analysis->openFoldWorkflow() && candidate.size() == 4) {
+                    bool coherent = false;
+                    for (size_t diagonal = 0; diagonal < 2; ++diagonal) {
+                        Vector3 p[4];
+                        for (size_t j = 0; j < 4; ++j)
+                            p[j] = positionOf(candidate[(j + diagonal) % 4], keep, keepPosition);
+                        const auto a = Vector3::crossProduct(p[1] - p[0], p[2] - p[0]);
+                        const auto b = Vector3::crossProduct(p[2] - p[0], p[3] - p[0]);
+                        coherent |= Vector3::dotProduct(a, a + b) > 0 && Vector3::dotProduct(b, a + b) > 0;
+                    }
+                    if (!coherent) {
+                        valid = false;
+                        break;
+                    }
                 }
                 const auto oldNormal = faceNormal(face, unmovedVertex, Vector3());
                 const auto newNormal = faceNormal(candidate, keep, keepPosition);

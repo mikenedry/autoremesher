@@ -20,6 +20,7 @@
 #ifndef AUTO_REMESHER_QUAD_EXTRACTOR_H
 #define AUTO_REMESHER_QUAD_EXTRACTOR_H
 #include <AutoRemesher/Progress>
+#include <AutoRemesher/SurfaceRelaxation>
 #include <AutoRemesher/Vector2>
 #include <AutoRemesher/Vector3>
 #include <cstdint>
@@ -86,12 +87,14 @@ public:
     }
 
     void setSurfaceAnalysis(const SurfaceAnalysis* analysis) { m_analysis = analysis; }
+    void setRelaxationMetric(const std::vector<SurfaceRelaxationFace>* metric) { m_relaxationMetric = metric; }
     size_t constrainedCurveVertices() const { return m_curveVertices; }
     void setFullTurnVertices(const std::vector<size_t>* vertices) { m_fullTurnVertices = vertices; }
     size_t poleTriangles() const { return m_poleTriangles; }
     bool extract(bool rejectUnsupportedCaps = false, bool closeResidualHoles = false);
 
 private:
+    friend struct QuadExtractorTestAccess;
     // The isoline a connection was cut from: which uv coordinate is held constant,
     // which integer value it is held at, and which triangle produced the segment.
     struct ConnectionInfo {
@@ -101,6 +104,7 @@ private:
     };
 
     const SurfaceAnalysis* m_analysis = nullptr;
+    const std::vector<SurfaceRelaxationFace>* m_relaxationMetric = nullptr;
     bool m_rejectUnsupportedCaps = false;
     size_t m_curveVertices = 0;
     const std::vector<size_t>* m_fullTurnVertices = nullptr;

@@ -86,6 +86,7 @@ void QuadMeshGenerator::generate()
     m_autoRemesher->setModelType(m_parameters.modelType);
     m_autoRemesher->setGradientAdaptivity(m_parameters.adaptivity);
     m_autoRemesher->setAnisotropy(m_parameters.anisotropy);
+    m_autoRemesher->setClothFoldGuidance(m_parameters.clothFoldGuidance);
     m_autoRemesher->setSharpEdgeDegrees(m_parameters.sharpEdgeDegrees);
     m_autoRemesher->setSmoothNormalDegrees(m_parameters.smoothNormalDegrees);
     m_autoRemesher->setTag(this);
