@@ -16,6 +16,8 @@ The changes target meshes where small features, narrow connections or closely sp
 
 Source-surface tracking, shared feature and curvature analysis, directional sizing, and topology-aware extraction work together to preserve these features. Preparation alternatives are compared using surface fit and topology so that a cleaner-looking fragment does not win simply by omitting difficult geometry. These are optimization targets; achievable detail still depends on the source mesh, settings and available quad budget.
 
+For open garments, enable **Cloth folds** to guide quad rows and spacing along curved folds. This option is off by default: open mechanical shells and decorative moldings should keep the standard treatment. For batch remeshing, add `--cloth-folds` to the command line. In the C++ API, use `setClothFoldGuidance(true)` before remeshing.
+
 AutoRemesher uses [Geogram](https://github.com/BrunoLevy/geogram), [libigl](https://github.com/libigl), [isotropicremesher](https://github.com/huxingyi/isotropicremesher) and [other libraries](ACKNOWLEDGEMENTS.html).
 
 Support the original author's work: [donate to Jeremy HU](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=GHALWLWXYGCU6&item_name=Support+me+coding+in+my+spare+time&currency_code=AUD&source=url).

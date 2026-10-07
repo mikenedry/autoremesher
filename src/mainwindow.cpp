@@ -279,6 +279,13 @@ MainWindow::MainWindow()
         m_anisotropy = value;
     });
 
+    m_clothFoldGuidanceCheckBox = new QCheckBox(tr("Cloth folds"), this);
+    m_clothFoldGuidanceCheckBox->setChecked(m_clothFoldGuidance);
+    m_clothFoldGuidanceCheckBox->setToolTip(tr("Guide topology to follow curved folds on open cloth surfaces."));
+    connect(m_clothFoldGuidanceCheckBox, &QCheckBox::toggled, [=](bool checked) {
+        m_clothFoldGuidance = checked;
+    });
+
     m_targetQuadCountWidget = new IntNumberWidget(this, false);
     m_targetQuadCountWidget->setItemName(tr("Target Quads"));
     m_targetQuadCountWidget->setRange(1000, 1000000);
@@ -330,6 +337,7 @@ MainWindow::MainWindow()
     controlsLayout->addWidget(m_smoothNormalDegreesWidget);
     controlsLayout->addWidget(m_adaptivityWidget);
     controlsLayout->addWidget(m_anisotropyWidget);
+    controlsLayout->addWidget(m_clothFoldGuidanceCheckBox);
     controlsLayout->addWidget(m_targetQuadCountWidget);
     controlsLayout->addWidget(m_targetScalingWidget);
     //controlsLayout->addWidget(m_modelTypeSelectBox);
@@ -452,6 +460,7 @@ void MainWindow::updateButtonStates()
         m_smoothNormalDegreesWidget->setEnabled(true);
         m_adaptivityWidget->setEnabled(true);
         m_anisotropyWidget->setEnabled(true);
+        m_clothFoldGuidanceCheckBox->setEnabled(true);
         //m_modelTypeSelectBox->setEnabled(true);
         if (nullptr != m_remeshedQuads) {
             m_saveMeshButton->show();
@@ -476,6 +485,7 @@ void MainWindow::updateButtonStates()
         m_smoothNormalDegreesWidget->setDisabled(true);
         m_adaptivityWidget->setDisabled(true);
         m_anisotropyWidget->setDisabled(true);
+        m_clothFoldGuidanceCheckBox->setDisabled(true);
         //m_modelTypeSelectBox->setDisabled(true);
     }
 
@@ -1010,7 +1020,7 @@ void MainWindow::setHeadlessParams(const QString& inputPath, const QString& outp
     int targetQuads, double edgeScaling,
     double sharpEdgeDegrees, double smoothNormalDegrees,
     double adaptivity,
-    double anisotropy)
+    double anisotropy, bool clothFoldGuidance)
 {
     m_headlessMode = true;
     m_headlessOutputPath = outputPath;
@@ -1021,6 +1031,7 @@ void MainWindow::setHeadlessParams(const QString& inputPath, const QString& outp
     m_smoothNormalDegrees = static_cast<float>(smoothNormalDegrees);
     m_adaptivity = static_cast<float>(adaptivity);
     m_anisotropy = static_cast<float>(anisotropy);
+    m_clothFoldGuidance = clothFoldGuidance;
 }
 
 void MainWindow::saveMeshToFile(const QString& filename)
@@ -1080,6 +1091,7 @@ void MainWindow::runHeadless()
     parameters.modelType = m_modelType;
     parameters.adaptivity = m_adaptivity;
     parameters.anisotropy = m_anisotropy;
+    parameters.clothFoldGuidance = m_clothFoldGuidance;
     parameters.sharpEdgeDegrees = m_sharpEdgeDegrees;
     parameters.smoothNormalDegrees = m_smoothNormalDegrees;
 
@@ -1124,6 +1136,7 @@ void MainWindow::generateQuadMesh()
     parameters.modelType = m_modelType;
     parameters.adaptivity = m_adaptivity;
     parameters.anisotropy = m_anisotropy;
+    parameters.clothFoldGuidance = m_clothFoldGuidance;
     parameters.sharpEdgeDegrees = m_sharpEdgeDegrees;
     parameters.smoothNormalDegrees = m_smoothNormalDegrees;
 

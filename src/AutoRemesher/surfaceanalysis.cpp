@@ -13,6 +13,24 @@
 
 namespace AutoRemesher {
 namespace {
+    bool hasBoundary(const SurfaceMesh& mesh)
+    {
+        for (size_t c = 0; c < mesh.cornerCount(); ++c) {
+            if (!mesh.isBoundaryCorner(c))
+                continue;
+            const size_t a = mesh.cornerVertex(c), b = mesh.cornerVertex(mesh.nextCorner(c));
+            if (a == b)
+                continue;
+            size_t incidence = 0;
+            for (size_t corner : mesh.cornersAroundVertex(a))
+                incidence += mesh.cornerVertex(mesh.nextCorner(corner)) == b
+                    || mesh.cornerVertex(mesh.previousCorner(corner)) == b;
+            // Detached or inconsistently wound adjacency is not an authored opening.
+            if (incidence == 1)
+                return true;
+        }
+        return false;
+    }
     double dot(const Vector3& a, const Vector3& b) { return Vector3::dotProduct(a, b); }
     Vector3 center(const SurfaceMesh& m, size_t f)
     {
@@ -45,9 +63,36 @@ namespace {
         return (p - trianglePoint(m, f, p)).lengthSquared();
     }
     bool safeMove(const std::vector<Vector3>& vertices, const std::vector<std::vector<size_t>>& faces,
-        const std::vector<size_t>& incident, size_t v, const Vector3& q)
+        const std::vector<size_t>& incident, size_t v, const Vector3& q, bool preserveQuadFans)
     {
-        for (size_t f : incident)
+        for (size_t f : incident) {
+            if (preserveQuadFans && faces[f].size() == 4) {
+                std::array<Vector3, 4> oldPoints, newPoints;
+                for (size_t k = 0; k < 4; ++k) {
+                    oldPoints[k] = vertices[faces[f][k]];
+                    newPoints[k] = faces[f][k] == v ? q : oldPoints[k];
+                }
+                const Vector3 oldNormal = Vector3::crossProduct(oldPoints[2] - oldPoints[0], oldPoints[3] - oldPoints[1]);
+                const Vector3 newNormal = Vector3::crossProduct(newPoints[2] - newPoints[0], newPoints[3] - newPoints[1]);
+                // A concave quad may have only one coherent triangulation. Use
+                // the same diagonal before/after, independent of the cyclic start.
+                bool allowed = false;
+                for (size_t start = 0; start < 2 && !allowed; ++start) {
+                    bool valid = true;
+                    for (size_t k = 1; k < 3; ++k) {
+                        const size_t a = start, b = (start + k) % 4, c = (start + k + 1) % 4;
+                        const Vector3 before = Vector3::crossProduct(oldPoints[b] - oldPoints[a], oldPoints[c] - oldPoints[a]);
+                        const Vector3 after = Vector3::crossProduct(newPoints[b] - newPoints[a], newPoints[c] - newPoints[a]);
+                        valid &= dot(before, oldNormal) > 0 && dot(after, newNormal) > 0
+                            && after.lengthSquared() >= .0025 * before.lengthSquared()
+                            && dot(before, after) > .1 * before.length() * after.length();
+                    }
+                    allowed = valid;
+                }
+                if (!allowed)
+                    return false;
+                continue;
+            }
             for (size_t k = 1; k + 1 < faces[f].size(); ++k) {
                 const size_t ids[3] = { faces[f][0], faces[f][k], faces[f][k + 1] };
                 const Vector3 a = vertices[ids[0]], b = vertices[ids[1]], c = vertices[ids[2]];
@@ -57,6 +102,7 @@ namespace {
                 if (after.lengthSquared() < .0025 * before.lengthSquared() || dot(before, after) <= .1 * before.length() * after.length())
                     return false;
             }
+        }
         return true;
     }
 
@@ -97,7 +143,7 @@ namespace {
 
     SurfaceGuidance::Face evaluateCurvatureScales(const SurfaceMesh& mesh, size_t faceIndex,
         const std::array<Eigen::Matrix3d, scaleCount>& tensorsByRadius, const double* supportWeights,
-        const double* supportRadii, bool useVertexTensor)
+        const double* supportRadii, bool useVertexTensor, bool openFoldWorkflow = false)
     {
         SurfaceGuidance::Face selected;
         const Vector3 u = mesh.edgeVector(3 * faceIndex).normalized(), v = Vector3::crossProduct(mesh.faceNormal(faceIndex), u);
@@ -131,6 +177,7 @@ namespace {
             samples[s].confidence = (samples[s].major - samples[s].minor) / std::max(1e-30, samples[s].major);
         }
         double bestScore = -1;
+        int bestPriority = 0;
         for (size_t s = 0; s < scaleCount; ++s) {
             double agreement = 0, stability = 0, neighborCount = 0, directionDisagreement = 0;
             for (size_t j = 0; j < scaleCount; ++j)
@@ -152,7 +199,13 @@ namespace {
             for (size_t j = s ? s - 1 : 0; j <= std::min(scaleCount - 1, s + 1); ++j)
                 strict &= samples[j].confidence >= .7 && samples[j].major * supportRadii[j] >= 1 / 3.7979 && normalAlignment[j] <= .5;
             const double score = strict ? 3 - directionDisagreement / neighborCount : confidence * std::sqrt(coverage) + .1 * stability / neighborCount + .002 * s;
-            if (score > bestScore) {
+            // One supported scale can guide spacing without the neighboring
+            // valid scales required to fix a curvature direction.
+            const bool valid = useVertexTensor && samples[s].confidence >= .7 &&
+                samples[s].major * supportRadii[s] >= 1 / 3.7979 && normalAlignment[s] <= .5;
+            const int priority = !openFoldWorkflow ? 0 : strict ? 2 : valid ? 1 : 0;
+            if (priority > bestPriority || (priority == bestPriority && score > bestScore)) {
+                bestPriority = priority;
                 bestScore = score;
                 selected = samples[s];
                 selected.confidence = confidence;
@@ -215,12 +268,15 @@ namespace {
 }
 
 SurfaceAnalysis::SurfaceAnalysis(const SurfaceMesh& mesh, double length,
-    double sharpDegrees, double adaptivity, double anisotropy, bool featureLayout, bool measureCurvature, bool deferSpacing)
+    double sharpDegrees, double adaptivity, double anisotropy, bool featureLayout, bool measureCurvature, bool deferSpacing, const SurfaceAnalysis* original, bool clothFoldGuidance)
     : m_mesh(mesh)
     , m_length(std::max(1e-12, length))
     , m_features(mesh.cornerCount(), 0)
     , m_faces(mesh.faceCount())
     , m_featureLayout(featureLayout)
+    // Classify authored openings once; prepared adjacency cannot change provenance.
+    , m_openFoldWorkflow(original ? original->m_openFoldWorkflow
+                                  : clothFoldGuidance && hasBoundary(mesh) && !canConstrainRim(mesh, m_length))
 {
     traceFeatureChains(sharpDegrees);
     m_preserveRim = m_hasBoundary && canConstrainRim(mesh, m_length);
@@ -264,7 +320,7 @@ void SurfaceAnalysis::traceFeatureChains(double sharpDegrees)
         Chain chain;
         chain.first = start;
         size_t c = first, v = start;
-        bool protectedEdge = false;
+        bool protectedEdge = false, boundaryEdge = false;
         double maximumDihedral = 0, maximumTurn = 0;
         Vector3 previous;
         while (!visited[c]) {
@@ -276,6 +332,7 @@ void SurfaceAnalysis::traceFeatureChains(double sharpDegrees)
             visited[c] = true;
             chain.corners.push_back(c);
             chain.length += mesh.edgeVector(c).length();
+            boundaryEdge |= mesh.isBoundaryCorner(c);
             protectedEdge = protectedEdge || mesh.isBoundaryCorner(c) || std::fabs(mesh.normalAngle(c)) > hard;
             v = oppositeVertex(mesh, c, v);
             if (v == start || joint(v))
@@ -284,9 +341,11 @@ void SurfaceAnalysis::traceFeatureChains(double sharpDegrees)
         }
         chain.last = v;
         chain.closed = v == start;
-        // Compact automatic_classifier_rounds.ipp rule: shallow curved chains
-        // lack the straight/strong evidence needed to force a grid axis.
-        if (m_featureLayout && m_hasBoundary && !protectedEdge && !chain.closed && maximumDihedral < 44.5 * M_PI / 180 && maximumTurn >= 5 * M_PI / 180)
+        // A curved interior fold still needs geometric protection, but fixing
+        // its grid axis also excludes the bending samples along the fold.
+        // Let curvature guide these open strips; keep authored rim directions.
+        if (m_featureLayout && m_hasBoundary && !chain.closed && maximumTurn >= 5 * M_PI / 180
+            && (m_openFoldWorkflow ? !boundaryEdge : !protectedEdge && maximumDihedral < 44.5 * M_PI / 180))
             chain.directional = false;
         const double coherence = chain.closed ? 1.0 : (mesh.position(v) - mesh.position(start)).length() / std::max(1e-30, chain.length);
         chain.strength = protectedEdge ? 1.0 : (chain.length >= 2 * m_length && coherence >= .7 ? .5 * coherence : 0.0);
@@ -365,6 +424,10 @@ void SurfaceAnalysis::resolveFeatureJunctions()
         for (size_t i = 0; i < next.size(); ++i)
             m_chains[i].strength = next[i];
     }
+    if (m_openFoldWorkflow) {
+        restoreCreaseDirections();
+        resolveFoldDirections();
+    }
     m_cornerChain.assign(mesh.cornerCount(), none);
     for (size_t i = 0; i < m_chains.size(); ++i)
         for (size_t c : m_chains[i].corners) {
@@ -376,6 +439,173 @@ void SurfaceAnalysis::resolveFeatureJunctions()
                 m_cornerChain[o] = i;
             }
         }
+}
+
+void SurfaceAnalysis::resolveFoldDirections()
+{
+    if (!m_featureLayout)
+        return;
+    const auto& mesh = m_mesh;
+    const auto outgoing = [&](const Chain& chain, size_t v) {
+        const size_t c = v == chain.first ? chain.corners.front() : chain.corners.back();
+        return (mesh.position(oppositeVertex(mesh, c, v)) - mesh.position(v)).normalized();
+    };
+    // Semantic paths cross geometric corner splits while keeping
+    // the original curve identities, strengths, and projection ownership.
+    std::vector<size_t> parent(m_chains.size());
+    std::iota(parent.begin(), parent.end(), 0);
+    const auto root = [&](size_t i) {
+        while (parent[i] != i) {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        return i;
+    };
+    const auto join = [&](size_t a, size_t b) { parent[root(b)] = root(a); };
+    std::vector<std::vector<size_t>> ends(mesh.vertexCount());
+    for (size_t i = 0; i < m_chains.size(); ++i) {
+        ends[m_chains[i].first].push_back(i);
+        ends[m_chains[i].last].push_back(i);
+    }
+    // First recover paths split only by a geometric turn, including a
+    // short unselected bridge whose continuation has retained evidence.
+    for (const auto& e : ends)
+        if (e.size() == 2)
+            join(e[0], e[1]);
+    std::vector<double> strength(m_chains.size(), 0);
+    std::vector<size_t> initial(m_chains.size());
+    for (size_t i = 0; i < m_chains.size(); ++i) {
+        initial[i] = root(i);
+        strength[initial[i]] = std::max(strength[initial[i]], m_chains[i].strength);
+    }
+    // Resolve semantic incidence after unsupported side paths disappear.
+    // Decisions use the same frozen classification graph at every vertex.
+    for (const auto& e : ends) {
+        std::vector<size_t> active;
+        for (size_t i : e)
+            if (strength[initial[i]] > 0)
+                active.push_back(i);
+        if (active.size() == 2)
+            join(active[0], active[1]);
+    }
+    struct Evidence {
+        size_t members = 0, count = 0, endpoints = 0;
+        double minimum = M_PI, sum = 0, turn = 0;
+        bool boundary = false, branched = false;
+    };
+    std::vector<Evidence> evidence(m_chains.size());
+    for (size_t i = 0; i < m_chains.size(); ++i) {
+        const auto& chain = m_chains[i];
+        auto& g = evidence[root(i)];
+        ++g.members;
+        g.branched |= chain.closed;
+        size_t v = chain.first;
+        Vector3 previous;
+        for (size_t k = 0; k < chain.corners.size(); ++k) {
+            const size_t c = chain.corners[k], next = oppositeVertex(mesh, c, v);
+            const Vector3 d = (mesh.position(next) - mesh.position(v)).normalized();
+            const double angle = std::fabs(mesh.normalAngle(c));
+            g.minimum = std::min(g.minimum, angle);
+            g.sum += angle;
+            ++g.count;
+            g.boundary |= mesh.isBoundaryCorner(c);
+            if (k)
+                g.turn = std::max(g.turn, std::acos(std::max(-1., std::min(1., dot(previous, d)))));
+            previous = d;
+            v = next;
+        }
+    }
+    for (size_t v = 0; v < ends.size(); ++v) {
+        std::map<size_t, std::vector<size_t>> groups;
+        for (size_t i : ends[v])
+            groups[root(i)].push_back(i);
+        for (const auto& entry : groups) {
+            auto& g = evidence[entry.first];
+            const auto& e = entry.second;
+            g.branched |= e.size() > 2;
+            g.endpoints += e.size() == 1;
+            if (e.size() == 2 && e[0] != e[1])
+                g.turn = std::max(g.turn, std::acos(std::max(-1., std::min(1., -dot(outgoing(m_chains[e[0]], v), outgoing(m_chains[e[1]], v))))));
+        }
+    }
+    for (size_t i = 0; i < m_chains.size(); ++i) {
+        auto& chain = m_chains[i];
+        const auto& g = evidence[root(i)];
+        const bool strong = g.minimum >= M_PI / 3 && g.sum >= g.count * M_PI / 2;
+        if (chain.strength > 0 && chain.strength < 1 && !chain.closed
+            && g.members > 1 && g.endpoints == 2 && !g.boundary && !g.branched && !strong && g.turn >= 5 * M_PI / 180)
+            chain.directional = false;
+    }
+}
+
+void SurfaceAnalysis::restoreCreaseDirections()
+{
+    if (!m_featureLayout || !m_hasBoundary)
+        return;
+    const auto& mesh = m_mesh;
+    const size_t none = SurfaceMesh::npos;
+    // Keep every candidate edge as directional evidence, including short
+    // rejected branches and both arms of a closed loop at a junction.
+    std::vector<std::vector<size_t>> candidates(mesh.vertexCount());
+    for (const auto& chain : m_chains)
+        for (size_t c : chain.corners) {
+            candidates[mesh.cornerVertex(c)].push_back(c);
+            candidates[mesh.cornerVertex(mesh.nextCorner(c))].push_back(c);
+        }
+    std::vector<char> conflicted(m_chains.size(), false);
+    for (size_t i = 0; i < m_chains.size(); ++i)
+        if (!m_chains[i].closed)
+            for (size_t v : { m_chains[i].first, m_chains[i].last }) {
+                const size_t own = v == m_chains[i].first ? m_chains[i].corners.front() : m_chains[i].corners.back();
+                const Vector3 direction = (mesh.position(oppositeVertex(mesh, own, v)) - mesh.position(v)).normalized();
+                for (size_t c : candidates[v])
+                    if (c != own && dot(direction, (mesh.position(oppositeVertex(mesh, c, v)) - mesh.position(v)).normalized()) > .866)
+                        conflicted[i] = true;
+            }
+    std::vector<size_t> owner(mesh.cornerCount(), none);
+    std::vector<std::vector<size_t>> incident(mesh.vertexCount());
+    for (size_t i = 0; i < m_chains.size(); ++i)
+        if (m_chains[i].strength > 0)
+            for (size_t c : m_chains[i].corners) {
+                const size_t edge = std::min(c, mesh.oppositeCorner(c));
+                if (owner[edge] != none)
+                    continue;
+                owner[edge] = i;
+                incident[mesh.cornerVertex(edge)].push_back(edge);
+                incident[mesh.cornerVertex(mesh.nextCorner(edge))].push_back(edge);
+            }
+    std::vector<char> visited(mesh.cornerCount(), false);
+    const auto classify = [&](size_t start, size_t first) {
+        std::vector<size_t> members;
+        size_t vertex = start, edge = first;
+        double minimum = M_PI, sum = 0;
+        bool conflict = false;
+        while (!visited[edge]) {
+            visited[edge] = true;
+            members.push_back(owner[edge]);
+            conflict |= conflicted[owner[edge]];
+            const double angle = std::fabs(mesh.normalAngle(edge));
+            minimum = std::min(minimum, angle);
+            sum += angle;
+            vertex = oppositeVertex(mesh, edge, vertex);
+            if (vertex == start || incident[vertex].size() != 2)
+                break;
+            edge = incident[vertex][0] == edge ? incident[vertex][1] : incident[vertex][0];
+        }
+        // Assess sharpness over the connected path, so a sharp fragment
+        // inside a varying fold does not fix the grid direction alone.
+        if (!conflict && (vertex == start || (minimum >= M_PI / 3 && sum >= members.size() * M_PI / 2)))
+            for (size_t i : members)
+                m_chains[i].directional = true;
+    };
+    for (size_t vertex = 0; vertex < incident.size(); ++vertex)
+        if (incident[vertex].size() != 2)
+            for (size_t edge : incident[vertex])
+                if (!visited[edge])
+                    classify(vertex, edge);
+    for (size_t edge = 0; edge < owner.size(); ++edge)
+        if (owner[edge] != none && !visited[edge])
+            classify(mesh.cornerVertex(edge), edge);
 }
 
 void SurfaceAnalysis::measureFaceCurvature()
@@ -501,7 +731,9 @@ void SurfaceAnalysis::measureVertexCurvature()
             const size_t a = mesh.cornerVertex(c), b = mesh.cornerVertex(mesh.nextCorner(c));
             vertexEdges[a].push_back(c);
             vertexEdges[b].push_back(c);
-            if (m_features[c] > 0)
+            // Weak guides align rows without removing the bending samples
+            // that determine their spacing. Only resolved creases exclude them.
+            if (m_features[c] > 0 && (!m_openFoldWorkflow || m_features[c] >= 1 || m_chains[m_cornerChain[c]].closed))
                 excluded[a] = excluded[b] = true;
             if (o == none)
                 continue;
@@ -568,7 +800,7 @@ void SurfaceAnalysis::measureVertexCurvature()
                     sum[s] += vertexTensors[v][s];
             }
         const double weights[scaleCount] = { contributors, contributors, contributors, contributors, contributors };
-        m_faces[f] = evaluateCurvatureScales(mesh, f, sum, weights, radii.data(), true);
+        m_faces[f] = evaluateCurvatureScales(mesh, f, sum, weights, radii.data(), true, m_openFoldWorkflow);
     });
 }
 
@@ -738,21 +970,85 @@ double SurfaceAnalysis::surfaceDistanceSquared(const Vector3& p, Vector3* normal
 double SurfaceAnalysis::missingSurfaceError(const std::vector<Vector3>& vertices,
     const std::vector<std::vector<size_t>>& faces) const
 {
+    return measureLayoutFit(vertices, faces).missingError;
+}
+
+SurfaceAnalysis::LayoutFit SurfaceAnalysis::measureLayoutFit(const std::vector<Vector3>& vertices,
+    const std::vector<std::vector<size_t>>& faces,
+    const std::vector<SurfaceGuidance::Face>* sourceFlow) const
+{
+    LayoutFit result;
+    const auto invalid = []() {
+        LayoutFit value;
+        value.missingError = value.flowError = std::numeric_limits<double>::infinity();
+        return value;
+    };
+    for (const auto& p : vertices)
+        if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z()))
+            return invalid();
+    for (const auto& face : faces)
+        for (size_t v : face)
+            if (v >= vertices.size())
+                return invalid();
     std::vector<std::vector<size_t>> triangles;
-    for (const auto& f : faces)
-        for (size_t k = 1; k + 1 < f.size(); ++k)
-            triangles.push_back({ f[0], f[k], f[k + 1] });
-    if (triangles.empty())
-        return std::numeric_limits<double>::infinity();
+    std::vector<size_t> owners;
+    for (size_t f = 0; f < faces.size(); ++f)
+        for (size_t k = 1; k + 1 < faces[f].size(); ++k) {
+            triangles.push_back({ faces[f][0], faces[f][k], faces[f][k + 1] });
+            if (sourceFlow)
+                owners.push_back(f);
+        }
+    if (triangles.empty() || (sourceFlow && sourceFlow->size() != m_mesh.faceCount()))
+        return invalid();
     SurfaceAnalysis output(SurfaceMesh(vertices, triangles), m_length, 180, 0, 0, false, false);
-    double error = 0, area = 0;
+    double area = 0;
     for (size_t f = 0; f < m_mesh.faceCount(); ++f) {
         const auto& t = m_mesh.triangle(f);
         const double a = Vector3::area(m_mesh.position(t[0]), m_mesh.position(t[1]), m_mesh.position(t[2]));
-        error += a * output.surfaceDistanceSquared(center(m_mesh, f));
+        // Keep the original centroid fitting sample and arithmetic unchanged.
+        const double distance = output.surfaceDistanceSquared(center(m_mesh, f));
+        if (!std::isfinite(a) || !std::isfinite(distance))
+            return invalid();
+        result.missingError += a * distance;
         area += a;
+        if (!sourceFlow || !((*sourceFlow)[f].confidence > 0))
+            continue;
+        const auto& sample = (*sourceFlow)[f];
+        const Vector3 n = m_mesh.faceNormal(f);
+        Vector3 u = sample.direction - n * dot(sample.direction, n);
+        if (!std::isfinite(sample.confidence) || !std::isfinite(u.lengthSquared()))
+            return invalid();
+        if (!(u.lengthSquared() > 0))
+            continue;
+        u = u.normalized();
+        const Vector3 v = Vector3::crossProduct(n, u);
+        double loss = 0;
+        // Fixed degree-two source quadrature; candidate density never changes weights.
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const Vector3 point = (m_mesh.position(t[0]) + m_mesh.position(t[1]) + m_mesh.position(t[2])) / 6. + m_mesh.position(t[corner]) * .5;
+            const size_t nearest = output.nearestFace(point);
+            if (nearest == SurfaceMesh::npos || nearest >= owners.size())
+                return invalid();
+            const auto& polygon = faces[owners[nearest]];
+            double polygonLoss = 0;
+            for (size_t k = 0; k < polygon.size(); ++k) {
+                const Vector3 edge = vertices[polygon[(k + 1) % polygon.size()]] - vertices[polygon[k]];
+                const double x = dot(edge, u), y = dot(edge, v), length = std::hypot(x, y);
+                if (!std::isfinite(length))
+                    return invalid();
+                // sin(2 theta)^2 treats both grid axes, and either sign, alike.
+                const double product = length > 0 ? 2 * (x / length) * (y / length) : 1.;
+                polygonLoss += std::min(1., product * product);
+            }
+            loss += polygonLoss / polygon.size();
+        }
+        const double weight = a * sample.confidence;
+        result.flowError += weight * loss / 3.;
+        result.flowWeight += weight;
     }
-    return area > 0 ? error / area : 0;
+    result.missingError = area > 0 ? result.missingError / area : 0;
+    result.flowError = result.flowWeight > 0 ? result.flowError / result.flowWeight : 0;
+    return result;
 }
 
 SurfaceAnalysis::CurveBinding SurfaceAnalysis::bindCurve(const Vector3& p, double radius, bool boundaryOnly) const
@@ -828,7 +1124,8 @@ Vector3 SurfaceAnalysis::projectCurve(const CurveBinding& binding, const Vector3
 // This variant uses uniform damped averaging and connected-sheet/curve constraints.
 void SurfaceAnalysis::relaxSurface(std::vector<Vector3>& vertices,
     const std::vector<std::unordered_set<size_t>>& neighbors,
-    const std::vector<bool>& locked, const std::vector<std::vector<size_t>>& polygons, size_t iterations) const
+    const std::vector<bool>& locked, const std::vector<std::vector<size_t>>& polygons, size_t iterations,
+    const std::vector<SurfaceRelaxationStencil>* stencils) const
 {
     if (!m_tree || neighbors.size() != vertices.size() || locked.size() != vertices.size())
         return;
@@ -867,6 +1164,8 @@ void SurfaceAnalysis::relaxSurface(std::vector<Vector3>& vertices,
                 next[i] = projectCurve(curves[i], target);
                 return;
             }
+            if (m_openFoldWorkflow && stencils && stencils->size() == vertices.size() && (*stencils)[i].valid)
+                target = (vertices[i] + (*stencils)[i].target(vertices, i)) * .5;
             // Stay on the connected source sheet, bounded to 32 adjacent faces.
             // Feature edges are barriers; a nearby opposite sheet is never a candidate.
             size_t face = faces[i];
@@ -882,7 +1181,9 @@ void SurfaceAnalysis::relaxSurface(std::vector<Vector3>& vertices,
                     continue;
                 for (size_t c = 3 * current; c < 3 * current + 3; ++c) {
                     const size_t f = m_mesh.adjacentFace(c);
-                    if (f == SurfaceMesh::npos || m_features[c] > 0 || std::find(visited.begin(), visited.begin() + visitedCount, f) != visited.begin() + visitedCount)
+                    // Geometric protection survives when a fold stops fixing a grid axis.
+                    const size_t chain = m_cornerChain[c];
+                    if (f == SurfaceMesh::npos || (m_openFoldWorkflow ? chain != SurfaceMesh::npos && m_chains[chain].strength > 0 : m_features[c] > 0) || std::find(visited.begin(), visited.begin() + visitedCount, f) != visited.begin() + visitedCount)
                         continue;
                     const Vector3 p = trianglePoint(m_mesh, f, target);
                     const double d = (p - target).lengthSquared();
@@ -903,7 +1204,7 @@ void SurfaceAnalysis::relaxSurface(std::vector<Vector3>& vertices,
             next[i] = q;
         });
         for (size_t i = 0; i < vertices.size(); ++i)
-            if (!locked[i] && safeMove(vertices, polygons, incident[i], i, next[i])) {
+            if (!locked[i] && safeMove(vertices, polygons, incident[i], i, next[i], m_openFoldWorkflow)) {
                 vertices[i] = next[i];
                 faces[i] = nextFaces[i];
             }
@@ -962,7 +1263,7 @@ size_t SurfaceAnalysis::finishCurves(std::vector<Vector3>& vertices,
                     target = .5 * target + .5 * sum / double(count);
             }
             const Vector3 q = projectCurve(bindings[v], target);
-            if (safeMove(vertices, faces, incident[v], v, q))
+            if (safeMove(vertices, faces, incident[v], v, q, m_openFoldWorkflow))
                 vertices[v] = q;
             else if (!pass)
                 bindings[v] = CurveBinding();

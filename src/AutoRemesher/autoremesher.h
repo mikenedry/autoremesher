@@ -116,6 +116,9 @@ public:
         m_adaptivity = adaptivity;
     }
 
+    // Opt in to curved-fold guidance for open cloth surfaces.
+    void setClothFoldGuidance(bool enabled) { m_clothFoldGuidance = enabled; }
+
     void setSharpEdgeDegrees(double degrees)
     {
         m_sharpEdgeDegrees = degrees;
@@ -270,6 +273,7 @@ private:
     double m_sharpEdgeDegrees = m_defaultSharpEdgeDegrees;
     double m_smoothNormalDegrees = 0.0;
     ModelType m_modelType = ModelType::Organic;
+    bool m_clothFoldGuidance = false;
     AutoRemesherProgressHandler m_progressHandler = nullptr;
     void* m_tag = nullptr;
 

@@ -5,6 +5,7 @@
 #include <AutoRemesher/MeshSeparator>
 #include <AutoRemesher/MixedIntegerLeastSquares>
 #include <AutoRemesher/QuadExtractor>
+#include <AutoRemesher/Parameterizer>
 #include <AutoRemesher/QuadParameterizer>
 #include <AutoRemesher/SurfaceAnalysis>
 #include <isotropichalfedgemesh.h>
@@ -30,6 +31,331 @@ static void require(bool condition, const char* message)
 {
     if (!condition)
         throw std::runtime_error(message);
+}
+
+namespace AutoRemesher {
+// Test-only access to cycle extraction, before smoothing or hole repair.
+struct QuadExtractorTestAccess {
+    static const SurfaceAnalysis& workflow(bool open)
+    {
+        const std::vector<Vec3> p { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+        static const SurfaceAnalysis sheet(SurfaceMesh({ p[0], p[1], p[2] }, { { 0, 1, 2 } }),
+            .1, 90, 0, 0, false, false, false, nullptr, true);
+        static const SurfaceAnalysis solid(SurfaceMesh(p,
+            { { 0, 2, 1 }, { 0, 1, 3 }, { 1, 2, 3 }, { 2, 0, 3 } }), .1, 90, 0, 0, false, false);
+        return open ? sheet : solid;
+    }
+    static std::vector<Vec3> connections(const std::vector<Vec3>& points, const Faces& triangles,
+        const std::vector<std::vector<UV>>& uv, bool cloth = true)
+    {
+        QuadExtractor extractor(&points, &triangles, &uv);
+        extractor.setSurfaceAnalysis(&workflow(cloth));
+        std::vector<Vec3> crossings;
+        std::vector<size_t> owners;
+        std::set<std::pair<size_t, size_t>> edges;
+        extractor.extractConnections(&crossings, &owners, &edges);
+        return crossings;
+    }
+    static Faces finish(const std::vector<Vec3>& points, const Faces& faces, bool cloth = true)
+    {
+        QuadExtractor extractor(&points, &faces, nullptr);
+        extractor.setSurfaceAnalysis(&workflow(cloth));
+        extractor.m_remeshedVertices = points;
+        extractor.m_remeshedPolygons = faces;
+        extractor.restoreBoundary();
+        return extractor.m_remeshedPolygons;
+    }
+    static std::pair<std::vector<Vec3>, Faces> mergePentagons(const std::vector<Vec3>& source, const Faces& triangles,
+        const SurfaceAnalysis& analysis, const std::vector<Vec3>& points, const Faces& faces)
+    {
+        QuadExtractor extractor(&source, &triangles, nullptr);
+        extractor.setSurfaceAnalysis(&analysis);
+        extractor.m_remeshedVertices = points;
+        extractor.m_remeshedPolygons = faces;
+        extractor.mergeSharedFiveEdgeFaces();
+        return { extractor.m_remeshedVertices, extractor.m_remeshedPolygons };
+    }
+
+    static Faces splitSix(const std::vector<Vec3>& points, const Faces& faces, bool open = true)
+    {
+        std::vector<Vec3> source { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+        const Faces surface = open ? Faces { { 0, 1, 2 } }
+                                   : Faces { { 0, 2, 1 }, { 0, 1, 3 }, { 1, 2, 3 }, { 2, 0, 3 } };
+        if (open)
+            source.resize(3);
+        SurfaceAnalysis analysis(SurfaceMesh(source, surface), .1, 90, 0, 0, false, false, false, nullptr, true);
+        require(analysis.openFoldWorkflow() == open, "hex fixture has the wrong source workflow");
+        QuadExtractor extractor(&points, &faces, nullptr);
+        extractor.setSurfaceAnalysis(&analysis);
+        extractor.m_remeshedVertices = points;
+        extractor.m_remeshedPolygons = faces;
+        extractor.splitSixEdgeFaces();
+        require(extractor.m_remeshedVertices.size() == points.size(), "hex split changed vertex count");
+        for (size_t i = 0; i < points.size(); ++i)
+            require((extractor.m_remeshedVertices[i] - points[i]).lengthSquared() == 0, "hex split moved a vertex");
+        return extractor.m_remeshedPolygons;
+    }
+    using Graph = std::unordered_map<size_t, std::unordered_set<size_t>>;
+    static Faces extract(std::vector<Vec3> points, const std::vector<size_t>& owners, Graph graph, bool open = true)
+    {
+        const std::vector<Vec3> source { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+        const Faces triangles { { 0, 2, 3 }, { 0, 3, 1 }, { 0, 1, 2 }, { 0, 2, 1 } };
+        const std::vector<std::vector<UV>> uv;
+        const Faces surface = open ? Faces { { 0, 1, 2 } }
+                                   : Faces { { 0, 2, 1 }, { 0, 1, 3 }, { 1, 2, 3 }, { 2, 0, 3 } };
+        auto support = source;
+        if (open)
+            support.resize(3);
+        SurfaceAnalysis analysis(SurfaceMesh(support, surface), .1, 90, 0, 0, false, false, false, nullptr, true);
+        QuadExtractor extractor(&source, &triangles, &uv);
+        extractor.setSurfaceAnalysis(&analysis);
+        Faces result;
+        extractor.extractMesh(points, owners, graph, &result);
+        return result;
+    }
+};
+}
+
+static void constantCoordinateIntersections()
+{
+    const std::vector<Vec3> points { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 } };
+    const Faces triangles { { 0, 1, 2 } };
+    for (bool swap : { false, true })
+        for (double sign : { -1., 1. }) {
+            std::vector<std::vector<UV>> uv { { { sign * 25, 32.769546213747894 },
+                { sign * 25, 29.02313352630401 }, { sign * 25, 36.5159034436706 } } };
+            if (swap)
+                for (auto& p : uv[0])
+                    p = UV(p.y(), p.x());
+            const auto crossings = AutoRemesher::QuadExtractorTestAccess::connections(points, triangles, uv);
+            // Seven integer levels cross the perimeter twice, plus three corners.
+            require(crossings.size() == 17, "constant UV line gained a spurious crossing");
+            for (const auto& p : crossings)
+                require(p.x() < 1e-12 || p.y() < 1e-12 || p.x() + p.y() > 1 - 1e-12,
+                    "constant UV line created an interior intersection");
+        }
+    const auto ordinary = AutoRemesher::QuadExtractorTestAccess::connections(points, triangles,
+        { { { 0, 0 }, { 3, 0 }, { 0, 3 } } });
+    require(std::any_of(ordinary.begin(), ordinary.end(), [](const Vec3& p) {
+        return p.x() > .3 && p.y() > .3 && p.x() + p.y() < .7;
+    }), "ordinary UV triangle lost its interior grid crossing");
+}
+
+static void curveConstrainedPentagonMerge()
+{
+    // A hard fold supports one endpoint of the pentagons' shared edge.
+    // The ordinary midpoint leaves that fold, even though the merge stays manifold.
+    const std::vector<Vec3> closedPoints { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    const Faces closedTriangles { { 0, 2, 1 }, { 0, 1, 3 }, { 1, 2, 3 }, { 2, 0, 3 } };
+    const AutoRemesher::SurfaceAnalysis closed(AutoRemesher::SurfaceMesh(closedPoints, closedTriangles), 1, 60, 0, 0, false, false);
+    for (double scale : { .25, 1., 7. })
+        for (bool rotate : { false, true })
+            for (bool originalOpen : { false, true }) {
+                const double angle = 75 * M_PI / 180;
+                const auto point = [&](double x, double y) {
+                    const Vec3 p = x <= 0 ? Vec3(x, y, 0) : Vec3(x * std::cos(angle), y, x * std::sin(angle));
+                    return (rotate ? Vec3(p.z(), p.x(), p.y()) : p) * scale;
+                };
+                std::vector<Vec3> source;
+                Faces triangles;
+                for (int y = -1; y <= 1; ++y)
+                    for (int x = -1; x <= 1; ++x)
+                        source.push_back(point(2 * x, 2 * y));
+                for (size_t y = 0; y < 2; ++y)
+                    for (size_t x = 0; x < 2; ++x) {
+                        const size_t a = 3 * y + x;
+                        triangles.push_back({ a, a + 1, a + 4 });
+                        triangles.push_back({ a, a + 4, a + 3 });
+                    }
+                const AutoRemesher::SurfaceAnalysis analysis(AutoRemesher::SurfaceMesh(source, triangles), scale, 60, 0, 0, true, false, false, originalOpen ? nullptr : &closed, true);
+                const std::vector<Vec3> points { point(0, 0), point(.2, 0), point(.8, .6), point(.8, 1.2),
+                    point(-.8, 1.2), point(-.8, -1.2), point(.8, -1.2), point(.8, -.6) };
+                require(!analysis.supportsRimConstraints(), "crease merge fixture acquired a protected rim");
+                require(analysis.bindCurve(points[0], .02 * scale).chain != AutoRemesher::SurfaceMesh::npos
+                        && analysis.bindCurve(points[1], .02 * scale).chain == AutoRemesher::SurfaceMesh::npos,
+                    "crease merge fixture lacks one curve-bound endpoint");
+                const auto result = AutoRemesher::QuadExtractorTestAccess::mergePentagons(source, triangles, analysis,
+                    points, { { 0, 1, 2, 3, 4 }, { 1, 0, 5, 6, 7 } });
+                require(result.first.size() == 7 && result.second.size() == 2
+                        && result.second[0].size() == 4 && result.second[1].size() == 4,
+                    "valid crease-adjacent pentagons were not merged");
+                double nearest = 1e100;
+                for (const auto& p : result.first)
+                    nearest = std::min(nearest, (p - point(0, 0)).length());
+                require(originalOpen ? nearest < 1e-10 * scale : nearest > .05 * scale,
+                    "pentagon merge changed curve support or legacy midpoint behavior");
+            }
+}
+
+static void safeHexagonSplits()
+{
+    const auto checkSplit = [](const std::vector<Vec3>& points, const std::vector<size_t>& hex) {
+        const auto children = AutoRemesher::QuadExtractorTestAccess::splitSix(points, { hex });
+        require(children.size() == 2, "splittable hexagon lost its valid alternative");
+        Vec3 normal;
+        for (size_t i = 1; i + 1 < hex.size(); ++i)
+            normal += Vec3::crossProduct(points[hex[i]] - points[hex[0]], points[hex[i + 1]] - points[hex[0]]);
+        const auto turn = [&](size_t a, size_t b, size_t c) {
+            return Vec3::dotProduct(Vec3::crossProduct(points[b] - points[a], points[c] - points[a]), normal);
+        };
+        for (const auto& quad : children) {
+            require(quad.size() == 4, "hex split did not produce two quads");
+            for (size_t i = 0; i < 2; ++i) {
+                const size_t a = quad[i], b = quad[i + 1], c = quad[i + 2], d = quad[(i + 3) % 4];
+                require(!(turn(a, b, c) * turn(a, b, d) < 0 && turn(c, d, a) * turn(c, d, b) < 0),
+                    "hex split introduced a crossing quad perimeter");
+            }
+        }
+    };
+    // The best corner score chooses diagonal 2--5, which crosses this simple hexagon.
+    // Either of the other diagonals can produce two valid quads without moving a vertex.
+    const std::vector<Vec3> dent { { 8, 2, 0 }, { 5, 1.90, 0 }, { 0, 2, 0 },
+        { 0, 0, 0 }, { 8.2, 0, 0 }, { 8.2, 1.9, 0 } };
+    require(AutoRemesher::QuadExtractorTestAccess::splitSix(dent, { { 0, 1, 2, 3, 4, 5 } }, false)
+            == Faces({ { 2, 3, 4, 5 }, { 5, 0, 1, 2 } }),
+        "closed source changed the legacy hexagon score choice");
+    for (double scale : { .25, 1.0, 7.0 })
+        for (bool tilted : { false, true })
+            for (bool reversed : { false, true })
+                for (size_t start = 0; start < 6; ++start) {
+                    auto points = dent;
+                    for (auto& p : points)
+                        p = (tilted ? Vec3(.8 * p.x(), p.y(), .6 * p.x()) : p) * scale;
+                    std::vector<size_t> hex { 0, 1, 2, 3, 4, 5 };
+                    std::rotate(hex.begin(), hex.begin() + start, hex.end());
+                    if (reversed)
+                        std::reverse(hex.begin(), hex.end());
+                    checkSplit(points, hex);
+                }
+    std::vector<Vec3> convex;
+    for (size_t i = 0; i < 6; ++i)
+        convex.push_back({ std::cos(i * M_PI / 3), std::sin(i * M_PI / 3), 0 });
+    checkSplit(convex, { 0, 1, 2, 3, 4, 5 });
+    const std::vector<Vec3> line { { 0, 0, 0 }, { 1, 0, 0 }, { 2, 0, 0 }, { 3, 0, 0 }, { 4, 0, 0 }, { 5, 0, 0 } };
+    const Faces unsplittable { { 0, 1, 2, 3, 4, 5 } };
+    require(AutoRemesher::QuadExtractorTestAccess::splitSix(line, unsplittable) == unsplittable,
+        "hexagon without a valid split was changed");
+}
+
+static void occupiedFaceInteriors()
+{
+    using Access = AutoRemesher::QuadExtractorTestAccess;
+    const auto canonical = [](Faces faces) {
+        for (auto& face : faces)
+            std::rotate(face.begin(), std::min_element(face.begin(), face.end()), face.end());
+        std::sort(faces.begin(), faces.end());
+        return faces;
+    };
+    const auto extract = [&](const std::vector<Vec3>& points, const Faces& loops) {
+        std::set<std::pair<size_t, size_t>> edges;
+        for (const auto& face : loops)
+            for (size_t i = 0; i < face.size(); ++i)
+                edges.insert(std::minmax(face[i], face[(i + 1) % face.size()]));
+        Access::Graph graph;
+        for (const auto& edge : edges) {
+            graph[edge.first].insert(edge.second);
+            graph[edge.second].insert(edge.first);
+        }
+        return canonical(Access::extract(points, std::vector<size_t>(points.size(), 2), std::move(graph)));
+    };
+    // The nonplanar larger cycle cuts through the planar accepted quad
+    // along edge3--4, creating an overlapping extra fan.
+    const std::vector<Vec3> points { { -1, 1, 0 }, { -1, 0, 0 }, { -1, -.02, -.1 },
+        { 0, -.1, 0 }, { 0, .1, 0 }, { 1, 0, 0 }, { 1, 1, 0 } };
+    require(extract(points, { { 3, 5, 4, 1 }, { 0, 1, 2, 3, 4, 5, 6 } })
+            == canonical({ { 3, 5, 4, 1 } }),
+        "larger cycle overlapped an already extracted cell");
+    // A triangle and a concave quad legitimately share a two-edge path.
+    require(extract({ { 0, 0, 0 }, { .2, .5, 0 }, { 0, 1, 0 }, { 1, .5, 0 } },
+                { { 0, 1, 2, 3 }, { 0, 1, 2 } })
+            == canonical({ { 3, 2, 1, 0 }, { 0, 1, 2 } }),
+        "connected shared boundary path lost a cell");
+    // An exterior diagonal of the concave cell must remain harmless.
+    require(extract({ { 0, 0, 0 }, { 2, 0, 0 }, { .9, .9, 0 }, { 0, 2, 0 }, { 2, 2, 0 } },
+                { { 0, 1, 2, 3 }, { 1, 4, 3 } })
+            == canonical({ { 4, 3, 2, 1 }, { 2, 3, 0, 1 } }),
+        "exterior graph chord removed a valid concave cell");
+    // A cell can surround an earlier quad without crossing its interior.
+    require(extract({ { -2, 2, 0 }, { 2, 2, 0 }, { 2, -2, 0 }, { 1, -1, 0 },
+                { .5, 0, 0 }, { -2, -2, 0 }, { 1, 1, 0 } },
+                { { 6, 1, 2, 3 }, { 1, 6, 4, 3, 2, 5, 0 } })
+            == canonical({ { 2, 1, 6, 3 }, { 4, 6, 1, 0, 5, 2, 3 }, { 4, 3, 6 } }),
+        "surrounding cell with no interior chord was removed");
+}
+
+static void subdividedExtractionCorners()
+{
+    using Access = AutoRemesher::QuadExtractorTestAccess;
+    const auto canonical = [](Faces faces) {
+        for (auto& face : faces)
+            std::rotate(face.begin(), std::min_element(face.begin(), face.end()), face.end());
+        std::sort(faces.begin(), faces.end());
+        return faces; // Retain duplicates and winding so either causes comparison failure.
+    };
+    const auto graphFor = [](const Faces& faces) {
+        std::set<std::pair<size_t, size_t>> edges;
+        for (const auto& face : faces)
+            for (size_t i = 0; i < face.size(); ++i)
+                edges.insert(std::minmax(face[i], face[(i + 1) % face.size()]));
+        Access::Graph graph;
+        for (const auto& edge : edges) {
+            graph[edge.first].insert(edge.second);
+            graph[edge.second].insert(edge.first);
+        }
+        return graph;
+    };
+
+    // Five cells meet at 0. Nodes 1 and 2 only subdivide two shared edges.
+    // Reserving either undirected corner wrongly omits one of its incident cells.
+    std::vector<Vec3> points { { 0, 0, 0 }, { -.25, 0, 0 }, { .75, 0, 0 },
+        { 0, 0, -1 }, { 0, 1, 0 }, { 1, 0, 0 }, { 0, -1, 0 }, { -1, 0, 0 },
+        { 0, 1, -1 }, { -1, -1, 0 }, { -1, 1, 0 }, { 1, -1, 0 }, { 1, 0, -1 } };
+    // Source-triangle owners provide +X, +Y and +Z normals at the sharp corner.
+    std::vector<size_t> owners { 2, 2, 2, 1, 2, 1, 2, 2, 0, 2, 2, 2, 1 };
+    const Faces expected { { 4, 0, 3, 8 }, { 11, 5, 2, 0, 6 }, { 10, 7, 1, 0, 4 },
+        { 0, 1, 7, 9, 6 }, { 0, 2, 5, 12, 3 } };
+    auto graph = graphFor(expected);
+    require(canonical(Access::extract(points, owners, graph)) == canonical(expected),
+        "subdivided extraction edge lost a cell or emitted a duplicate/reversed cell");
+    require(Access::extract(points, owners, graph, false).size() == 3,
+        "open-fold recovery changed closed-source corner ownership");
+
+    // A true junction still reserves its undirected corner.
+    for (size_t node : { size_t(1), size_t(2) }) {
+        graph[node].insert(points.size());
+        graph[points.size()].insert(node);
+        points.push_back(points[node] + Vec3(0, 0, 1));
+        owners.push_back(2);
+    }
+    require(Access::extract(points, owners, graph).size() == 3,
+        "higher-degree extraction corner reservation was bypassed");
+
+    // An all-degree-two loop still emits exactly one source-facing cell.
+    const std::vector<Vec3> square { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 } };
+    for (size_t normal : { size_t(2), size_t(3) }) {
+        Faces cell { { 0, 1, 2, 3 } };
+        if (normal == 3)
+            std::reverse(cell[0].begin(), cell[0].end());
+        require(canonical(Access::extract(square, std::vector<size_t>(4, normal), graphFor(cell))) == canonical(cell),
+            "degree-two loop duplicated a face or crossed the source sheet");
+    }
+}
+
+static void collapsedOutputFaces()
+{
+    for (double scale : { 1., 7. }) {
+        std::vector<Vec3> points { { 0, 0, 0 }, { 1, 0, 0 }, { 2, 0, 0 },
+            { 3, 0, 0 }, { 4, 0, 0 }, { 1, 1e-180, 0 } };
+        for (auto& p : points)
+            p = scale * Vec3(p.z(), p.x(), p.y());
+        const Faces valid { { 0, 1, 5 } };
+        require(AutoRemesher::QuadExtractorTestAccess::finish(points,
+                    { { 0, 1, 2, 3, 4 }, valid[0] }) == valid,
+            "collapsed output face survived or a thin valid face was removed");
+        const Faces input { { 0, 1, 2, 3, 4 }, valid[0] };
+        require(AutoRemesher::QuadExtractorTestAccess::finish(points, input, false) == input,
+            "cloth cleanup changed legacy closed-face retention");
+    }
 }
 
 static void tube(size_t sides, size_t rings, std::vector<Vec3>& p, Faces& t,
@@ -576,6 +902,64 @@ static void directionalQuadCover()
             }
 }
 
+static void staggeredFeatureBand()
+{
+    // Two staggered, nearly parallel feature segments on an anisotropic patch.
+    // Their closest tips have the opposite transverse order from the continuous
+    // cover. Opening the band must preserve that cover order and one cell of width.
+    for (double scale : { .25, 1., 7. })
+        for (bool rotate : { false, true }) {
+            std::vector<Vec3> p;
+            Faces t;
+            for (size_t y = 0; y < 4; ++y)
+                for (size_t x = 0; x < 3; ++x) {
+                    double px = double(x) - 1, py = y < 2 ? double(y) - 1 : double(y) - 2 + .1;
+                    if (x == 1)
+                        px = y < 2 ? .1 * (1 - double(y)) : .002 - .1 * (double(y) - 2);
+                    p.push_back((rotate ? Vec3(0, px, py) : Vec3(px, py, 0)) * scale);
+                }
+            for (size_t y = 0; y < 3; ++y)
+                for (size_t x = 0; x < 2; ++x) {
+                    const size_t a = 3 * y + x;
+                    t.push_back({ a, a + 1, a + 4 });
+                    t.push_back({ a, a + 4, a + 3 });
+                }
+            const AutoRemesher::SurfaceMesh mesh(p, t);
+            std::vector<char> features(mesh.cornerCount(), 0);
+            for (size_t c = 0; c < mesh.cornerCount(); ++c) {
+                const auto a = mesh.cornerVertex(c), b = mesh.cornerVertex(mesh.nextCorner(c));
+                features[c] = (std::min(a, b) == 1 && std::max(a, b) == 4)
+                    || (std::min(a, b) == 7 && std::max(a, b) == 10);
+            }
+            const std::vector<Vec3> field(t.size(), rotate ? Vec3(0, 0, 1) : Vec3(0, 1, 0));
+            const std::vector<double> u(t.size(), 1), v(t.size(), .05);
+            AutoRemesher::QuadParameterizer::Result result;
+            require(AutoRemesher::QuadParameterizer::parameterize(p, t, &field, .4 * scale / mesh.averageEdgeLength(),
+                        180, &result, nullptr, &u, &v, nullptr, &features, true, nullptr, true, true),
+                "staggered feature cover failed");
+            require(std::fabs(result.triangleUvs[8][1].y() - result.triangleUvs[0][2].y() - 1) < 1e-7,
+                "feature separation reversed or collapsed the staggered band");
+            AutoRemesher::QuadParameterizer::Result legacy;
+            require(AutoRemesher::QuadParameterizer::parameterize(p, t, &field, .4 * scale / mesh.averageEdgeLength(),
+                        180, &legacy, nullptr, &u, &v, nullptr, &features, true, nullptr, true),
+                "legacy staggered feature cover failed");
+            require(std::fabs(legacy.triangleUvs[8][1].y() - legacy.triangleUvs[0][2].y() + 1) < 1e-7,
+                "default feature separation changed legacy ordering");
+            for (const auto& uv : result.triangleUvs)
+                require((uv[1].x() - uv[0].x()) * (uv[2].y() - uv[0].y())
+                        - (uv[1].y() - uv[0].y()) * (uv[2].x() - uv[0].x()) > 0,
+                    "staggered feature cover folded a triangle");
+            for (size_t c = 0; c < features.size(); ++c)
+                if (features[c]) {
+                    const auto& a = result.triangleUvs[c / 3][c % 3];
+                    const auto& b = result.triangleUvs[c / 3][(c + 1) % 3];
+                    require(std::fabs(a.y() - b.y()) < 1e-7 && std::fabs(a.y() - std::round(a.y())) < 1e-7
+                            && std::fabs(a.x() - b.x()) > 1,
+                        "staggered feature lost its noncollapsed integer isoline");
+                }
+        }
+}
+
 static void oddTubePeriod()
 {
     // Five cells around a tube require an odd chart translation. An even-only
@@ -797,10 +1181,108 @@ static void boundedRefinement()
     }
 }
 
+static void originalOpenWorkflow()
+{
+    // A weakly creased cube is closed; removing its warped top is preparation only.
+    // Reversing that relationship checks that capping does not erase provenance.
+    for (double scale : { 1., 7. }) {
+        std::vector<Vec3> points = { { -1, -1, -1 }, { 1, -1, -1 }, { 1, 1, -1 }, { -1, 1, -1 },
+            { -1, -1, 1.4 }, { 1, -1, 1 }, { 1, 1, 1 }, { -1, 1, 1 } };
+        for (auto& p : points)
+            p = scale * Vec3(p.z(), p.x(), p.y());
+        const Faces quads = { { 0, 3, 2, 1 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 },
+            { 1, 2, 6, 5 }, { 2, 3, 7, 6 }, { 3, 0, 4, 7 } };
+        Faces closed, open;
+        for (size_t f = 0; f < quads.size(); ++f)
+            for (size_t k = 1; k < 3; ++k) {
+                closed.push_back({ quads[f][0], quads[f][k], quads[f][k + 1] });
+                if (f != 1)
+                    open.push_back(closed.back());
+            }
+        const auto hasCurvature = [](const AutoRemesher::SurfaceAnalysis& analysis) {
+            return std::any_of(analysis.faces().begin(), analysis.faces().end(),
+                [](const AutoRemesher::SurfaceGuidance::Face& face) { return face.major > 1e-6; });
+        };
+        Faces inconsistent = closed;
+        std::reverse(inconsistent[0].begin(), inconsistent[0].end());
+        AutoRemesher::SurfaceAnalysis windingGap(AutoRemesher::SurfaceMesh(points, inconsistent), .2 * scale, 100, 1, 1, true, true, false, nullptr, true);
+        require(!hasCurvature(windingGap), "two-sided incidence was mistaken for an authored opening");
+        for (bool originallyOpen : { false, true }) {
+            const Faces& source = originallyOpen ? open : closed;
+            const Faces& prepared = originallyOpen ? closed : open;
+            AutoRemesher::SurfaceAnalysis original(AutoRemesher::SurfaceMesh(points, source), .2 * scale, 100, 1, 1, true, true, false, nullptr, true);
+            AutoRemesher::SurfaceAnalysis measured(AutoRemesher::SurfaceMesh(points, prepared), .2 * scale, 100, 1, 1,
+                true, true, false, &original);
+            require(hasCurvature(original) == originallyOpen, "closed weak creases changed their legacy curvature exclusion");
+            require(hasCurvature(measured) == originallyOpen, "prepared hole or cap changed the original curvature policy");
+            AutoRemesher::Parameterizer parameterizer(&points, &prepared, nullptr);
+            parameterizer.setSurfaceAnalysis(&original);
+            parameterizer.setSharpEdgeDegrees(100);
+            parameterizer.setGradientAdaptivity(1);
+            parameterizer.setAnisotropy(1);
+            require(parameterizer.parameterize(true), "source-provenance cover failed");
+            require(!parameterizer.relaxationMetric().empty() == originallyOpen,
+                "prepared hole or cap changed the original relaxation metric policy");
+        }
+    }
+}
+
+static void curvatureFieldSupport()
+{
+    // A marginal curvature estimate should yield to the adjacent authored axis.
+    // Well-supported curvature, explicit features and legacy solves stay fixed.
+    for (double scale : { 1., 7. })
+        for (bool taper : { true, false })
+            for (bool feature : { false, true })
+                for (double support : { .28, .8 }) {
+                    const std::vector<Vec3> points { { 0, 0, 0 }, { scale, 0, 0 },
+                        { scale, scale, 0 }, { 0, scale, 0 } };
+                    const Faces faces { { 0, 1, 2 }, { 0, 2, 3 } };
+                    AutoRemesher::SurfaceMesh mesh(points, faces);
+                    AutoRemesher::SurfaceGuidance guidance;
+                    guidance.faces.resize(2);
+                    guidance.featureCorners.assign(6, 0);
+                    guidance.featureCorners[0] = 1;
+                    guidance.featureCorners[4] = feature;
+                    const double angle = M_PI / 8;
+                    guidance.faces[0].direction = Vec3(1, 0, 0);
+                    guidance.faces[1].direction = Vec3(std::cos(angle), std::sin(angle), 0);
+                    for (auto& face : guidance.faces) {
+                        face.confidence = 1;
+                        face.major = support / scale;
+                        face.radius = scale;
+                    }
+                    std::vector<Vec3> field;
+                    require(AutoRemesher::FrameField::create(mesh, 90, &field, &guidance, true, taper),
+                        "curvature support field solve failed");
+                    const auto difference = [](const Vec3& a, const Vec3& b) {
+                        const double cosine = std::min(1., std::fabs(Vec3::dotProduct(a, b)));
+                        const double radians = std::acos(cosine);
+                        return std::min(radians, M_PI / 2 - radians);
+                    };
+                    require(difference(field[0], guidance.faces[0].direction) < 1e-7,
+                        "curvature support changed an authored field axis");
+                    if (taper && !feature && support < .3)
+                        require(difference(field[1], field[0]) < .01,
+                            "marginal curvature overrode the adjacent authored axis");
+                    else
+                        require(difference(field[1], guidance.faces[1].direction) < 1e-7,
+                            "curvature support weakened a reliable, explicit or legacy constraint");
+                }
+}
+
 int main(int argc, char** argv)
 {
     try {
         if (argc == 1) {
+            collapsedOutputFaces();
+            safeHexagonSplits();
+            curveConstrainedPentagonMerge();
+            curvatureFieldSupport();
+            originalOpenWorkflow();
+            occupiedFaceInteriors();
+            constantCoordinateIntersections();
+            subdividedExtractionCorners();
             protectedPreparationRims();
             boundedRefinement();
             balancedRefinement();
@@ -811,12 +1293,14 @@ int main(int argc, char** argv)
             disconnectedFans();
             directionalQuadCover();
             rotatedBoundaryCover();
+            staggeredFeatureBand();
             oddTubePeriod();
             featureIntegerLattice();
             tubeOpenings();
             radialCover();
         } else {
-            require(argc == 4, "usage: reference_surface_test [input.obj target_quads output.obj]");
+            require(argc == 4 || (argc == 5 && std::string(argv[4]) == "--cloth"),
+                "usage: reference_surface_test [input.obj target_quads output.obj [--cloth]]");
             tinyobj::attrib_t attributes;
             std::vector<tinyobj::shape_t> shapes;
             std::vector<tinyobj::material_t> materials;
@@ -831,6 +1315,7 @@ int main(int argc, char** argv)
                     triangles.push_back({ size_t(shape.mesh.indices[i].vertex_index),
                         size_t(shape.mesh.indices[i + 1].vertex_index), size_t(shape.mesh.indices[i + 2].vertex_index) });
             Remesher remesher(vertices, triangles);
+            remesher.setClothFoldGuidance(argc == 5);
             remesher.setTargetTriangleCount(std::stoull(argv[2]) * 2);
             remesher.setScaling(1.0);
             remesher.setSharpEdgeDegrees(90.0);

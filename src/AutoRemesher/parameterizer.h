@@ -20,6 +20,7 @@
 #ifndef AUTO_REMESHER_PARAMETERIZER_H
 #define AUTO_REMESHER_PARAMETERIZER_H
 #include <AutoRemesher/Progress>
+#include <AutoRemesher/SurfaceRelaxation>
 #include <AutoRemesher/Vector2>
 #include <AutoRemesher/Vector3>
 #include <map>
@@ -97,6 +98,7 @@ public:
         m_progressHandler = std::move(progressHandler);
     }
 
+    const std::vector<SurfaceRelaxationFace>& relaxationMetric() const { return m_relaxationMetric; }
     const std::vector<size_t>& fullTurnVertices() const { return m_fullTurnVertices; }
     void setSurfaceAnalysis(const SurfaceAnalysis* analysis) { m_analysis = analysis; }
     void setSpacingRefinement(bool refine) { m_spacingRefinement = refine; }
@@ -106,6 +108,7 @@ public:
 private:
     const SurfaceAnalysis* m_analysis = nullptr;
     std::vector<size_t> m_fullTurnVertices;
+    std::vector<SurfaceRelaxationFace> m_relaxationMetric;
     const std::vector<Vector3>* m_vertices = nullptr;
     const std::vector<std::vector<size_t>>* m_triangles = nullptr;
     const std::vector<Vector3>* m_triangleFieldVectors = nullptr;

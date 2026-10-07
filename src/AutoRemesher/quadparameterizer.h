@@ -36,6 +36,7 @@ public:
     struct Result {
         std::vector<std::vector<Vector2>> triangleUvs;
         std::vector<Vector3> field;
+        std::vector<Vector2> physicalSpacing; // Feature-layout lengths in the final field basis.
         std::vector<int> cornerRotations;
         std::vector<size_t> singularVertices;
         std::vector<size_t> fullTurnVertices;
@@ -51,7 +52,8 @@ public:
         // step of the whole pipeline and would otherwise be one silent block.
         const ProgressHandler* progressHandler = nullptr,
         const std::vector<char>* featureCorners = nullptr, bool featureLayout = false,
-        const SurfaceGuidance* sizing = nullptr, bool preserveBoundary = false);
+        const SurfaceGuidance* sizing = nullptr, bool preserveBoundary = false,
+        bool preserveFeatureOrder = false);
 };
 
 }
